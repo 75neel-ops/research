@@ -1,6 +1,8 @@
 import html
 import json
+import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -36,21 +38,22 @@ CATEGORIES = [
     "Corporate & Historical Archives",
     "Archaeological Records",
     "Scientific Journals & Records",
+    "Historical Newspapers",
 ]
 
 
 # ---------------------------------------------------------------------
-# Secrets and access gate
+# Secrets and password gate
 # ---------------------------------------------------------------------
 
 def get_secret(name):
-    """Read a value from Streamlit Secrets, or from environment variables."""
+    """Read a value from Streamlit Secrets or environment variables."""
     try:
         value = st.secrets.get(name, "")
     except Exception:
         value = ""
 
-    return value or __import__("os").getenv(name, "")
+    return value or os.getenv(name, "")
 
 
 app_password = get_secret("APP_PASSWORD")
@@ -66,10 +69,7 @@ if not st.session_state.get("authenticated", False):
     st.title("📚 Research Assistant")
     st.write("Enter the app password to continue.")
 
-    entered_password = st.text_input(
-        "App password",
-        type="password",
-    )
+    entered_password = st.text_input("App password", type="password")
 
     if st.button("Continue", type="primary"):
         if entered_password == app_password:
@@ -82,7 +82,7 @@ if not st.session_state.get("authenticated", False):
 
 
 # ---------------------------------------------------------------------
-# Supabase storage
+# Supabase project storage
 # ---------------------------------------------------------------------
 
 def supabase_config():
@@ -171,7 +171,7 @@ def delete_project(name):
 
 
 # ---------------------------------------------------------------------
-# General helpers
+# Shared data helpers
 # ---------------------------------------------------------------------
 
 def clean_text(value):
@@ -200,9 +200,9 @@ def make_record(
     abstract = clean_text(abstract)
 
     if full_text_url:
-        access_status = "Full-text/document link listed; not verified"
+        access_status = "Document/full-text link listed; not verified"
     elif abstract:
-        access_status = "Abstract or description available"
+        access_status = "Abstract, OCR snippet, or description available"
     else:
         access_status = "Catalogue/record link only"
 
@@ -229,13 +229,19 @@ def make_record(
 
 def normalize_doi(value):
     value = (value or "").strip().lower()
-    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+
+    for prefix in (
+        "https://doi.org/",
+        "http://doi.org/",
+        "doi:",
+    ):
         value = value.replace(prefix, "")
+
     return value
 
 
 def deduplicate(records):
-    """Merge duplicate search results using DOI first, then title."""
+    """Merge duplicates using DOI first and title second."""
     merged = {}
 
     for record in records:
@@ -245,8 +251,8 @@ def deduplicate(records):
             " ",
             (record.get("title") or "").lower(),
         ).strip()
-        key = doi or title
 
+        key = doi or title
         if not key:
             continue
 
@@ -275,21 +281,23 @@ def deduplicate(records):
             existing["abstract"] = record["abstract"]
 
         source_names = {
-            name.strip()
-            for name in (
+            item.strip()
+            for item in (
                 (existing.get("database", "") + "," +
                  record.get("database", "")).split(",")
             )
-            if name.strip()
+            if item.strip()
         }
         existing["database"] = ", ".join(sorted(source_names))
 
         if existing.get("full_text_url"):
             existing["access_status"] = (
-                "Full-text/document link listed; not verified"
+                "Document/full-text link listed; not verified"
             )
         elif existing.get("abstract"):
-            existing["access_status"] = "Abstract or description available"
+            existing["access_status"] = (
+                "Abstract, OCR snippet, or description available"
+            )
         else:
             existing["access_status"] = "Catalogue/record link only"
 
@@ -301,7 +309,7 @@ def year_in_range(year, start_year, end_year):
         year_value = int(str(year)[:4])
         return int(start_year) <= year_value <= int(end_year)
     except (ValueError, TypeError):
-        # Retain records whose provider did not supply a usable year.
+        # Retain records if their source has no usable date.
         return True
 
 
@@ -309,8 +317,12 @@ def current_timestamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def safe_key(value):
+    return re.sub(r"\W+", "_", str(value))[:60]
+
+
 # ---------------------------------------------------------------------
-# Search APIs: research and scientific records
+# Research-paper search providers
 # ---------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -370,20 +382,21 @@ def search_openalex(query, start_year, end_year, limit):
 
         doi = item.get("doi") or ""
 
-        record = make_record(
-            title=item.get("title"),
-            authors=", ".join(authors),
-            year=item.get("publication_year"),
-            abstract=abstract,
-            url=doi or item.get("id", ""),
-            full_text_url=full_text_url,
-            venue=venue,
-            source="OpenAlex",
-            doi=doi,
-            record_type=item.get("type", ""),
-            citations=item.get("cited_by_count", ""),
+        records.append(
+            make_record(
+                title=item.get("title"),
+                authors=", ".join(authors),
+                year=item.get("publication_year"),
+                abstract=abstract,
+                url=doi or item.get("id", ""),
+                full_text_url=full_text_url,
+                venue=venue,
+                source="OpenAlex",
+                doi=doi,
+                record_type=item.get("type", ""),
+                citations=item.get("cited_by_count", ""),
+            )
         )
-        records.append(record)
 
     return records
 
@@ -417,12 +430,10 @@ def search_crossref(query, start_year, end_year, limit):
 
         for author in item.get("author", []):
             name = " ".join(
-                part
-                for part in [
+                part for part in [
                     author.get("given", ""),
                     author.get("family", ""),
-                ]
-                if part
+                ] if part
             )
             if name:
                 authors.append(name)
@@ -439,8 +450,10 @@ def search_crossref(query, start_year, end_year, limit):
 
         pdf_url = ""
         for link in item.get("link", []):
-            content_type = (link.get("content-type") or "").lower()
-            if "pdf" in content_type and link.get("URL"):
+            if (
+                "pdf" in (link.get("content-type") or "").lower()
+                and link.get("URL")
+            ):
                 pdf_url = link["URL"]
                 break
 
@@ -683,7 +696,7 @@ def search_arxiv(query, start_year, end_year, limit):
         records.append(
             make_record(
                 title=title,
-                authors=", ".join(author for author in authors if author),
+                authors=", ".join(name for name in authors if name),
                 year=year,
                 abstract=abstract,
                 url=record_url,
@@ -705,7 +718,6 @@ def search_doaj(query, start_year, end_year, limit):
         "https://doaj.org/api/search/articles/"
         f"{quote(query, safe='')}"
     )
-
     response = requests.get(
         endpoint,
         params={"page": 1, "pageSize": limit},
@@ -739,7 +751,6 @@ def search_doaj(query, start_year, end_year, limit):
             ),
             "",
         )
-
         record_url = full_text_url or (
             links[0].get("url", "") if links else ""
         )
@@ -812,6 +823,13 @@ def search_datacite(query, start_year, end_year, limit):
             else ""
         )
 
+        type_info = attributes.get("types") or {}
+        record_type = (
+            type_info.get("resourceTypeGeneral")
+            or type_info.get("resourceType")
+            or "Research output"
+        )
+
         records.append(
             make_record(
                 title=title,
@@ -822,7 +840,7 @@ def search_datacite(query, start_year, end_year, limit):
                 venue=attributes.get("publisher", ""),
                 source="DataCite",
                 doi=doi_url,
-                record_type="Research output or dataset",
+                record_type=record_type,
                 access_notes=(
                     "Metadata is available; access to the underlying output "
                     "depends on its provider."
@@ -834,13 +852,19 @@ def search_datacite(query, start_year, end_year, limit):
 
 
 # ---------------------------------------------------------------------
-# Library of Congress API and official catalogue links
+# Library of Congress API
 # ---------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_library_of_congress(query, limit):
+def search_library_of_congress(query, limit, newspaper_only=False):
+    endpoint = (
+        "https://www.loc.gov/newspapers/"
+        if newspaper_only
+        else "https://www.loc.gov/search/"
+    )
+
     response = requests.get(
-        "https://www.loc.gov/search/",
+        endpoint,
         params={"fo": "json", "q": query, "c": limit},
         headers=HEADERS,
         timeout=45,
@@ -886,8 +910,16 @@ def search_library_of_congress(query, limit):
                 abstract=" ".join(str(value) for value in descriptions),
                 url=item.get("url", ""),
                 full_text_url=listed_url,
-                source="Library of Congress",
-                record_type="Library/archive catalogue record",
+                source=(
+                    "Library of Congress — Newspapers"
+                    if newspaper_only
+                    else "Library of Congress"
+                ),
+                record_type=(
+                    "Newspaper catalogue record"
+                    if newspaper_only
+                    else "Library/archive catalogue record"
+                ),
                 access_notes=(
                     "A listed online resource does not guarantee complete "
                     "digitization or access."
@@ -898,7 +930,239 @@ def search_library_of_congress(query, limit):
     return records
 
 
-def official_catalogue_links(query, category):
+# ---------------------------------------------------------------------
+# Historical newspaper searches
+# ---------------------------------------------------------------------
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_internet_archive_newspapers(query, limit):
+    """Search Internet Archive metadata for text items matching the query."""
+    response = requests.get(
+        "https://archive.org/advancedsearch.php",
+        params={
+            "q": f"({query}) AND mediatype:texts",
+            "fl[]": ["identifier", "title", "date", "creator", "description"],
+            "rows": limit,
+            "page": 1,
+            "output": "json",
+            "sort[]": "score desc",
+        },
+        headers=HEADERS,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    docs = (
+        response.json()
+        .get("response", {})
+        .get("docs", [])
+    )
+    records = []
+
+    for item in docs:
+        identifier = item.get("identifier", "")
+        record_url = (
+            f"https://archive.org/details/{identifier}"
+            if identifier
+            else "https://archive.org/"
+        )
+
+        title = item.get("title", "")
+        if isinstance(title, list):
+            title = "; ".join(str(value) for value in title)
+
+        creator = item.get("creator", "")
+        if isinstance(creator, list):
+            creator = ", ".join(str(value) for value in creator)
+
+        description = item.get("description", "")
+        if isinstance(description, list):
+            description = " ".join(str(value) for value in description)
+
+        records.append(
+            make_record(
+                title=title,
+                authors=creator,
+                year=item.get("date", ""),
+                abstract=description,
+                url=record_url,
+                source="Internet Archive",
+                record_type="Archive catalogue record",
+                access_notes=(
+                    "The record may describe a digitized item, but this "
+                    "search does not verify whether pages or OCR are available."
+                ),
+            )
+        )
+
+    return records
+
+
+def pick_text(value):
+    """Europeana fields can be strings, lists, or language dictionaries."""
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, list):
+        return "; ".join(
+            pick_text(item) for item in value if item
+        )
+
+    if isinstance(value, dict):
+        values = []
+        for item in value.values():
+            if isinstance(item, list):
+                values.extend(str(x) for x in item if x)
+            elif item:
+                values.append(str(item))
+        return "; ".join(values)
+
+    return ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_europeana_newspapers(query, limit, api_key):
+    if not api_key:
+        raise ValueError("EUROPEANA_API_KEY is not set in Streamlit Secrets.")
+
+    response = requests.get(
+        "https://api.europeana.eu/record/v2/search.json",
+        params={
+            "wskey": api_key,
+            "query": query,
+            "rows": limit,
+            "profile": "rich",
+        },
+        headers=HEADERS,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    records = []
+
+    for item in response.json().get("items", []):
+        title = pick_text(item.get("title"))
+        creators = pick_text(item.get("dcCreator"))
+        date = pick_text(item.get("year")) or pick_text(item.get("timestamp"))
+        description = pick_text(item.get("dcDescription"))
+
+        record_url = (
+            pick_text(item.get("edmIsShownAt"))
+            or item.get("guid")
+            or ""
+        )
+
+        # This is a provider-listed digital resource, not a guarantee it opens.
+        digital_url = pick_text(item.get("edmIsShownBy"))
+
+        provider = pick_text(item.get("dataProvider"))
+        country = pick_text(item.get("country"))
+        language = pick_text(item.get("language"))
+
+        notes = "Europeana catalogue record."
+        extra = []
+        if provider:
+            extra.append(f"Data provider: {provider}")
+        if country:
+            extra.append(f"Country: {country}")
+        if language:
+            extra.append(f"Language: {language}")
+        if extra:
+            notes += " " + " ".join(extra)
+
+        records.append(
+            make_record(
+                title=title,
+                authors=creators,
+                year=date,
+                abstract=description,
+                url=record_url,
+                full_text_url=digital_url,
+                venue=provider,
+                source="Europeana",
+                record_type="Newspaper/archive catalogue record",
+                access_notes=notes,
+            )
+        )
+
+    return records
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_trove_newspapers(query, limit, api_key):
+    if not api_key:
+        raise ValueError("TROVE_API_KEY is not set in Streamlit Secrets.")
+
+    response = requests.get(
+        "https://api.trove.nla.gov.au/v3/result",
+        params={
+            "key": api_key,
+            "q": query,
+            "zone": "newspaper",
+            "encoding": "json",
+            "n": limit,
+        },
+        headers=HEADERS,
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    zones = data.get("response", {}).get("zone", [])
+    records = []
+
+    for zone in zones:
+        articles = zone.get("records", {}).get("article", [])
+
+        if isinstance(articles, dict):
+            articles = [articles]
+
+        for item in articles:
+            title = (
+                item.get("heading")
+                or item.get("title")
+                or item.get("newspaperTitle")
+                or "Trove newspaper article"
+            )
+
+            snippet = item.get("snippet", "")
+            date = item.get("date", "")
+            record_url = item.get("troveUrl", "")
+
+            newspaper = item.get("newspaperTitle", "")
+            place = item.get("place", "")
+            state = item.get("state", "")
+
+            notes_parts = [
+                "Trove article record. OCR snippets, when supplied, may contain recognition errors."
+            ]
+            if newspaper:
+                notes_parts.append(f"Newspaper: {newspaper}.")
+            if place:
+                notes_parts.append(f"Place: {place}.")
+            if state:
+                notes_parts.append(f"State: {state}.")
+
+            records.append(
+                make_record(
+                    title=title,
+                    year=date,
+                    abstract=snippet,
+                    url=record_url,
+                    source="Trove",
+                    record_type="Newspaper article record",
+                    access_notes=" ".join(notes_parts),
+                )
+            )
+
+    return records
+
+
+# ---------------------------------------------------------------------
+# Official catalogue links
+# ---------------------------------------------------------------------
+
+def catalogue_links(query, category):
     encoded = quote((query or "").strip())
 
     if category == "Corporate & Historical Archives":
@@ -913,25 +1177,25 @@ def official_catalogue_links(query, category):
                 "Tata Central Archives",
                 "India",
                 "https://www.tatacentralarchives.com/",
-                "Check the institution's site for collections and access.",
+                "Check the institution's official site for collection access.",
             ),
             (
                 "Godrej Archives",
                 "India",
                 "https://www.godrej.com/godrej-archives",
-                "Check the institution's site for collections and access.",
+                "Check the institution's official site for collection access.",
             ),
             (
                 "National Archives Catalog (NARA)",
                 "United States",
                 f"https://catalog.archives.gov/search?query={encoded}",
-                "Catalogue records may require an archive visit or request.",
+                "Some catalogue records require an archive visit or request.",
             ),
             (
                 "Library of Congress",
                 "United States",
                 f"https://www.loc.gov/search/?q={encoded}",
-                "The app can search LOC using its official API.",
+                "The app can search this source through its official API.",
             ),
             (
                 "The National Archives — Discovery",
@@ -946,7 +1210,7 @@ def official_catalogue_links(query, category):
                 "Archives Hub",
                 "United Kingdom",
                 f"https://archiveshub.jisc.ac.uk/search/?terms={encoded}",
-                "Search descriptions from participating archive repositories.",
+                "Search descriptions from participating UK repositories.",
             ),
         ]
 
@@ -980,7 +1244,7 @@ def official_catalogue_links(query, category):
                 "Library of Congress",
                 "United States",
                 f"https://www.loc.gov/search/?q={encoded}",
-                "The app can search LOC using its official API.",
+                "The app can search this source through its official API.",
             ),
         ]
 
@@ -1006,6 +1270,124 @@ def official_catalogue_links(query, category):
             ),
         ]
 
+    if category == "Historical Newspapers":
+        return [
+            (
+                "National Digital Library of India",
+                "India",
+                f"https://ndl.iitkgp.ac.in/",
+                "Search the official NDLI portal; newspaper coverage varies.",
+            ),
+            (
+                "National Archives of India — Abhilekh Patal",
+                "India",
+                "https://abhilekh-patal.in/",
+                "Official archival catalogue; access and digitization vary.",
+            ),
+            (
+                "National Library of India",
+                "India",
+                "https://www.nationallibrary.gov.in/",
+                "Check the official catalogue and newspaper holdings.",
+            ),
+            (
+                "NewspaperSG — National Library Board",
+                "Singapore",
+                "https://eresources.nlb.gov.sg/newspapers/",
+                "Singapore newspaper archive; access may depend on location or account.",
+            ),
+            (
+                "National Library of Malaysia",
+                "Malaysia",
+                "https://www.pnm.gov.my/",
+                "Use the official library site/catalogue; historical newspaper coverage varies.",
+            ),
+            (
+                "National Archives of Malaysia",
+                "Malaysia",
+                "https://www.arkib.gov.my/",
+                "Use the official archive site for catalogue and access information.",
+            ),
+            (
+                "National Library of Indonesia",
+                "Indonesia",
+                "https://www.perpusnas.go.id/",
+                "Use the official library site/catalogue.",
+            ),
+            (
+                "Khastara Digital Collections",
+                "Indonesia",
+                "https://khastara.perpusnas.go.id/",
+                "Digital collection portal; holdings and access vary.",
+            ),
+            (
+                "National Library of the Philippines",
+                "Philippines",
+                "https://web.nlp.gov.ph/",
+                "Use the official library site for catalogue and access information.",
+            ),
+            (
+                "National Library of Thailand",
+                "Thailand",
+                "https://www.nlt.go.th/",
+                "Use the official library site; search and digitization options may vary.",
+            ),
+            (
+                "National Library of Vietnam",
+                "Vietnam",
+                "https://nlv.gov.vn/",
+                "Use the official library site/catalogue.",
+            ),
+            (
+                "National Archives of Brunei Darussalam",
+                "Brunei",
+                "https://www.arkib.gov.bn/",
+                "Use the official archive site for holdings and access information.",
+            ),
+            (
+                "National Library of Cambodia",
+                "Cambodia",
+                "https://www.nlc.gov.kh/",
+                "Use the official library site; online catalogue coverage may vary.",
+            ),
+            (
+                "National Library of Laos",
+                "Laos",
+                "https://www.lao-nlp.org/",
+                "Check the official site; online historical newspaper access may be limited.",
+            ),
+            (
+                "National Library of Myanmar",
+                "Myanmar",
+                "https://www.nlm.gov.mm/",
+                "Check the official site; catalogue and digitized holdings may vary.",
+            ),
+            (
+                "Trove Newspapers",
+                "Australia",
+                "https://trove.nla.gov.au/newspaper/",
+                "Trove API search is available after adding TROVE_API_KEY.",
+            ),
+            (
+                "Europeana",
+                "Europe / International",
+                f"https://www.europeana.eu/en/search?query={encoded}",
+                "Europeana results depend on participating providers and their access settings.",
+            ),
+            (
+                "Internet Archive",
+                "International",
+                f"https://archive.org/search?query={encoded}",
+                "Search results may be catalogue records; item access varies.",
+            ),
+            (
+                "Library of Congress — Newspapers",
+                "United States",
+                f"https://www.loc.gov/newspapers/?q={encoded}",
+                "The app searches this official API when you run a newspaper search.",
+            ),
+        ]
+
     return []
 
 
@@ -1013,13 +1395,10 @@ def show_catalogue_links(query, category):
     st.markdown("#### Official catalogue links")
     st.caption(
         "These are links to official institution sites. The app does not "
-        "scrape them. Catalogue records do not guarantee digitized or "
-        "free-to-access documents."
+        "scrape them. Holdings, digitization, OCR, and public access vary."
     )
 
-    for institution, country, url, note in official_catalogue_links(
-        query, category
-    ):
+    for institution, country, url, note in catalogue_links(query, category):
         st.markdown(
             f"**{institution}** ({country})  \n"
             f"[Open official catalogue/site]({url})  \n"
@@ -1028,7 +1407,40 @@ def show_catalogue_links(query, category):
 
 
 # ---------------------------------------------------------------------
-# Citation checks, screening, exports, AI
+# Search logs
+# ---------------------------------------------------------------------
+
+def add_search_log(category, query, sources, start_year="", end_year="",
+                   limit="", outcomes=None):
+    logs = st.session_state.setdefault("search_logs", [])
+    logs.append({
+        "searched_at": current_timestamp(),
+        "category": category,
+        "query": query,
+        "sources": ", ".join(sources) if isinstance(sources, list) else sources,
+        "from_year": start_year,
+        "to_year": end_year,
+        "limit": limit,
+        "outcomes": json.dumps(outcomes or {}, ensure_ascii=False),
+    })
+
+
+def show_search_logs():
+    logs = st.session_state.get("search_logs", [])
+
+    with st.expander("Reproducible search log"):
+        if not logs:
+            st.caption("No searches logged in this project yet.")
+        else:
+            st.dataframe(
+                pd.DataFrame(logs),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+# ---------------------------------------------------------------------
+# Citation checks, exports, and AI outline
 # ---------------------------------------------------------------------
 
 def citation_issues(record):
@@ -1052,11 +1464,10 @@ def citation_quality_summary(records):
     if not records:
         return
 
-    issue_count = sum(bool(citation_issues(record)) for record in records)
+    count = sum(bool(citation_issues(record)) for record in records)
     st.caption(
-        f"Citation metadata check: {issue_count} of {len(records)} records "
-        "have one or more missing fields. This flags incomplete metadata; "
-        "it does not verify citation accuracy."
+        f"Basic metadata check: {count} of {len(records)} records have "
+        "one or more missing fields. This does not verify citation accuracy."
     )
 
 
@@ -1072,7 +1483,7 @@ def make_bibtex(records):
             first_author.split()[-1],
         )
         year = str(record.get("year") or "nd")
-        key = f"{last_name or 'source'}{year}{index}"
+        citation_key = f"{last_name or 'source'}{year}{index}"
 
         fields = {
             "title": record.get("title", ""),
@@ -1083,11 +1494,11 @@ def make_bibtex(records):
             "url": record.get("url", ""),
         }
 
-        lines = [f"@misc{{{key},"]
+        lines = [f"@misc{{{citation_key},"]
         for field, value in fields.items():
             if value:
-                value = str(value).replace("{", "").replace("}", "")
-                lines.append(f"  {field} = {{{value}}},")
+                safe_value = str(value).replace("{", "").replace("}", "")
+                lines.append(f"  {field} = {{{safe_value}}},")
         lines.append("}")
         entries.append("\n".join(lines))
 
@@ -1140,14 +1551,15 @@ def make_markdown(question, records, outline=""):
     for index, record in enumerate(records, start=1):
         title = record.get("title") or "Untitled"
         url = record.get("url") or ""
-
         lines.append(
             f"{index}. [{title}]({url})" if url else f"{index}. {title}"
         )
         lines.append(f"   - Authors: {record.get('authors') or 'Not listed'}")
         lines.append(f"   - Date/year: {record.get('year') or 'Not listed'}")
         lines.append(f"   - Source: {record.get('database') or 'Not listed'}")
-        lines.append(f"   - Access: {record.get('access_status') or 'Not listed'}")
+        lines.append(
+            f"   - Access: {record.get('access_status') or 'Not listed'}"
+        )
 
         if record.get("full_text_url"):
             lines.append(
@@ -1184,12 +1596,12 @@ def make_reference_list(records):
         venue = record.get("venue") or ""
         url = record.get("url") or ""
 
-        text = f"[S{index}] {authors} ({year}). *{title}*."
+        reference = f"[S{index}] {authors} ({year}). *{title}*."
         if venue:
-            text += f" {venue}."
+            reference += f" {venue}."
         if url:
-            text += f" [Open record]({url})"
-        lines.append(text)
+            reference += f" [Open record]({url})"
+        lines.append(reference)
 
     return "\n".join(lines)
 
@@ -1200,8 +1612,8 @@ def generate_outline(question, records):
 
     if not openai_key and not gemini_key:
         raise RuntimeError(
-            "Add OPENAI_API_KEY or GEMINI_API_KEY to Streamlit Secrets "
-            "to use AI summaries."
+            "Add OPENAI_API_KEY or GEMINI_API_KEY in Streamlit Secrets "
+            "to generate an AI outline."
         )
 
     source_blocks = []
@@ -1212,7 +1624,7 @@ def generate_outline(question, records):
             f"Authors: {record.get('authors') or 'Not supplied'}\n"
             f"Year: {record.get('year') or 'Not supplied'}\n"
             f"Abstract/description: "
-            f"{(record.get('abstract') or 'Not supplied')[:1600]}\n"
+            f"{(record.get('abstract') or 'Not supplied')[:1500]}\n"
             f"Record URL: {record.get('url') or 'Not supplied'}\n"
             f"Access label: {record.get('access_status') or 'Not supplied'}"
         )
@@ -1220,23 +1632,21 @@ def generate_outline(question, records):
     prompt = f"""
 Research question: {question}
 
-Write a concise literature-review outline based ONLY on the source
+Write a cautious literature-review outline using only the source
 information below.
 
 Rules:
-- Cite each evidence-based point using source IDs such as [S1].
+- Cite evidence-based points with source IDs such as [S1].
 - Do not invent findings, methods, authors, dates, or citations.
-- If the supplied abstract/description does not support a conclusion,
-  say that evidence is insufficient.
-- Do not say you read a full paper when only an abstract or catalogue
-  description was supplied.
+- Say when the supplied abstract or description is insufficient.
+- Do not claim to have read full text based only on a link.
 - This is a draft for a researcher to check against original sources.
 
 Sources:
 {chr(10).join(source_blocks)}
 """
 
-    # Use OpenAI if configured; otherwise use Gemini.
+    # Prefer OpenAI if its key is configured; otherwise use Gemini.
     if openai_key:
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -1286,7 +1696,7 @@ Sources:
 
 
 # ---------------------------------------------------------------------
-# Filters, screening, notes, and display
+# Filtering, screening, notes, and record display
 # ---------------------------------------------------------------------
 
 def filter_records(records, key_prefix):
@@ -1323,7 +1733,12 @@ def filter_records(records, key_prefix):
 
     sort_choice = st.selectbox(
         "Sort results",
-        ["Relevance/order found", "Newest first", "Oldest first", "Most cited"],
+        [
+            "Relevance/order found",
+            "Newest first",
+            "Oldest first",
+            "Most cited",
+        ],
         key=f"{key_prefix}_sort",
     )
 
@@ -1372,9 +1787,8 @@ def render_records(category, records, question, allow_ai=False):
         st.info("No results yet. Run a search above.")
         return
 
-    visible = filter_records(records, category.replace(" ", "_"))
+    visible = filter_records(records, safe_key(category))
     st.write(f"Showing **{len(visible)}** records.")
-
     citation_quality_summary(visible)
 
     rows = []
@@ -1387,7 +1801,9 @@ def render_records(category, records, question, allow_ai=False):
             "Venue/institution": record.get("venue", ""),
             "Source": record.get("database", ""),
             "Access status": record.get("access_status", ""),
-            "Citation check": "; ".join(issues) if issues else "Basic fields present",
+            "Citation check": (
+                "; ".join(issues) if issues else "Basic fields present"
+            ),
             "Record link": record.get("url", ""),
             "Listed document link": record.get("full_text_url", ""),
         })
@@ -1405,8 +1821,8 @@ def render_records(category, records, question, allow_ai=False):
     )
 
     st.caption(
-        "A listed full-text/document link has not been verified. It may "
-        "require sign-in, payment, permission, or an archive visit."
+        "A listed document link is not verified. It may require an account, "
+        "payment, permission, or an archive visit."
     )
 
     col1, col2, col3, col4 = st.columns(4)
@@ -1417,7 +1833,7 @@ def render_records(category, records, question, allow_ai=False):
             data=pd.DataFrame(visible).to_csv(index=False).encode("utf-8"),
             file_name="research_results.csv",
             mime="text/csv",
-            key=f"{category}_csv",
+            key=f"{safe_key(category)}_csv",
         )
 
     with col2:
@@ -1426,7 +1842,7 @@ def render_records(category, records, question, allow_ai=False):
             data=make_bibtex(visible),
             file_name="research_results.bib",
             mime="application/x-bibtex",
-            key=f"{category}_bib",
+            key=f"{safe_key(category)}_bib",
         )
 
     with col3:
@@ -1435,7 +1851,7 @@ def render_records(category, records, question, allow_ai=False):
             data=make_ris(visible),
             file_name="research_results.ris",
             mime="application/x-research-info-systems",
-            key=f"{category}_ris",
+            key=f"{safe_key(category)}_ris",
         )
 
     outline = st.session_state.get(f"{category}_outline", "")
@@ -1446,17 +1862,23 @@ def render_records(category, records, question, allow_ai=False):
             data=make_markdown(question, visible, outline),
             file_name="research_results.md",
             mime="text/markdown",
-            key=f"{category}_md",
+            key=f"{safe_key(category)}_markdown",
         )
 
-    st.markdown("#### Screen records and add notes")
+    st.markdown("#### Screening and researcher notes")
     st.caption(
-        "Screening decisions and notes are saved with the project when you "
-        "click Save project."
+        "Make changes inside each record, then save the project to preserve them."
     )
 
     for index, record in enumerate(visible):
         title = record.get("title") or "Untitled"
+        record_identity = (
+            record.get("doi")
+            or record.get("url")
+            or f"{title}_{index}"
+        )
+        form_key = f"{safe_key(category)}_record_{safe_key(record_identity)}"
+
         with st.expander(f"{index + 1}. {title}"):
             st.write(
                 f"**Source:** {record.get('database') or 'Not listed'}  \n"
@@ -1470,61 +1892,57 @@ def render_records(category, records, question, allow_ai=False):
                 st.markdown(
                     f"[Open listed document link]({record['full_text_url']})"
                 )
-
             if record.get("access_notes"):
                 st.caption(record["access_notes"])
 
             st.write(
                 record.get("abstract")
-                or "No abstract or description was supplied."
+                or "No abstract, OCR snippet, or description was supplied."
             )
 
-            record_id = record.get("doi") or record.get("url") or title
-            key_suffix = re.sub(r"\W+", "_", str(record_id))[:50]
-            st.selectbox(
-                "Screening decision",
-                ["Unscreened", "Include", "Exclude", "Maybe"],
-                index=(
-                    ["Unscreened", "Include", "Exclude", "Maybe"].index(
-                        record.get("screening", "Unscreened")
-                    )
-                    if record.get("screening", "Unscreened")
-                    in ["Unscreened", "Include", "Exclude", "Maybe"]
+            with st.form(form_key):
+                screening_options = [
+                    "Unscreened",
+                    "Include",
+                    "Exclude",
+                    "Maybe",
+                ]
+                current_screening = record.get("screening", "Unscreened")
+                screening_index = (
+                    screening_options.index(current_screening)
+                    if current_screening in screening_options
                     else 0
-                ),
-                key=f"{category}_{key_suffix}_screening",
-                on_change=lambda r=record, k=f"{category}_{key_suffix}_screening":
-                    r.update({"screening": st.session_state[k]}),
-            )
+                )
 
-            st.text_input(
-                "Reason for decision",
-                value=record.get("screening_reason", ""),
-                key=f"{category}_{key_suffix}_reason",
-                on_change=lambda r=record, k=f"{category}_{key_suffix}_reason":
-                    r.update({"screening_reason": st.session_state[k]}),
-            )
+                screening = st.selectbox(
+                    "Screening decision",
+                    screening_options,
+                    index=screening_index,
+                )
+                reason = st.text_input(
+                    "Reason for decision",
+                    value=record.get("screening_reason", ""),
+                )
+                tags = st.text_input(
+                    "Tags",
+                    value=record.get("tags", ""),
+                )
+                notes = st.text_area(
+                    "Researcher notes",
+                    value=record.get("researcher_notes", ""),
+                )
 
-            st.text_input(
-                "Tags",
-                value=record.get("tags", ""),
-                key=f"{category}_{key_suffix}_tags",
-                on_change=lambda r=record, k=f"{category}_{key_suffix}_tags":
-                    r.update({"tags": st.session_state[k]}),
-            )
-
-            st.text_area(
-                "Researcher notes",
-                value=record.get("researcher_notes", ""),
-                key=f"{category}_{key_suffix}_notes",
-                on_change=lambda r=record, k=f"{category}_{key_suffix}_notes":
-                    r.update({"researcher_notes": st.session_state[k]}),
-            )
+                if st.form_submit_button("Save screening and notes"):
+                    record["screening"] = screening
+                    record["screening_reason"] = reason
+                    record["tags"] = tags
+                    record["researcher_notes"] = notes
+                    st.success("Notes updated. Save the project to keep them.")
 
     if allow_ai and visible:
         if st.button(
             "Generate evidence-linked outline",
-            key=f"{category}_generate_ai",
+            key=f"{safe_key(category)}_generate_ai",
         ):
             try:
                 with st.spinner("Generating an abstract/record-based outline..."):
@@ -1551,46 +1969,32 @@ def render_records(category, records, question, allow_ai=False):
             st.markdown(linkify_citations(outline, outline_records))
             st.markdown(make_reference_list(outline_records))
             st.warning(
-                "This outline is based on the abstracts/descriptions supplied "
-                "to the AI. Check every claim against the original sources."
+                "The outline uses supplied abstracts or descriptions. "
+                "Verify every claim against the original sources."
             )
 
 
 # ---------------------------------------------------------------------
-# Search log helpers
+# Catalogue links
 # ---------------------------------------------------------------------
 
-def add_search_log(category, query, sources, start_year="", end_year="",
-                   limit="", outcomes=None):
-    logs = st.session_state.setdefault("search_logs", [])
-    logs.append({
-        "searched_at": current_timestamp(),
-        "category": category,
-        "query": query,
-        "sources": sources,
-        "start_year": start_year,
-        "end_year": end_year,
-        "limit": limit,
-        "outcomes": outcomes or {},
-    })
+def show_catalogue_links(query, category):
+    st.markdown("#### Official catalogue links")
+    st.caption(
+        "These are official-site links, not results automatically searched "
+        "by this app. Holdings and access vary."
+    )
 
-
-def show_search_logs():
-    logs = st.session_state.get("search_logs", [])
-
-    with st.expander("Reproducible search log"):
-        if not logs:
-            st.caption("No searches logged in this session/project yet.")
-        else:
-            st.dataframe(
-                pd.DataFrame(logs),
-                use_container_width=True,
-                hide_index=True,
-            )
+    for institution, country, url, note in catalogue_links(query, category):
+        st.markdown(
+            f"**{institution}** ({country})  \n"
+            f"[Open official catalogue/site]({url})  \n"
+            f"{note}"
+        )
 
 
 # ---------------------------------------------------------------------
-# Sidebar: project loading
+# Sidebar: load/delete projects
 # ---------------------------------------------------------------------
 
 with st.sidebar:
@@ -1600,30 +2004,31 @@ with st.sidebar:
         project_names = list_projects()
 
         if project_names:
-            chosen_project = st.selectbox(
+            selected_project = st.selectbox(
                 "Choose a project",
                 project_names,
                 key="project_to_load",
             )
 
             if st.button("Load project"):
-                saved = load_project(chosen_project)
-                if saved:
-                    st.session_state["loaded_project_payload"] = saved
-                    st.session_state["loaded_project_name"] = chosen_project
+                payload = load_project(selected_project)
+                if payload:
+                    st.session_state["loaded_project_payload"] = payload
+                    st.session_state["loaded_project_name"] = selected_project
                     st.rerun()
 
             if st.button("Delete project"):
-                delete_project(chosen_project)
+                delete_project(selected_project)
                 st.success("Project deleted.")
                 st.rerun()
         else:
             st.caption("No saved projects yet.")
 
     except Exception as exc:
-        st.error(f"Supabase connection problem: {exc}")
+        st.error(f"Could not connect to Supabase: {exc}")
 
     st.divider()
+
     if st.button("Log out"):
         st.session_state["authenticated"] = False
         st.rerun()
@@ -1633,15 +2038,20 @@ with st.sidebar:
 loaded_payload = st.session_state.pop("loaded_project_payload", None)
 
 if loaded_payload:
-    category = loaded_payload.get("category", "Research Papers")
-    st.session_state[f"{category}_records"] = loaded_payload.get("records", [])
-    st.session_state[f"{category}_question"] = loaded_payload.get("question", "")
-    st.session_state[f"{category}_outline"] = loaded_payload.get("outline", "")
-    st.session_state[f"{category}_outline_records"] = loaded_payload.get(
+    loaded_category = loaded_payload.get("category", "Research Papers")
+    st.session_state[f"{loaded_category}_records"] = loaded_payload.get(
+        "records", []
+    )
+    st.session_state[f"{loaded_category}_question"] = loaded_payload.get(
+        "question", ""
+    )
+    st.session_state[f"{loaded_category}_outline"] = loaded_payload.get(
+        "outline", ""
+    )
+    st.session_state[f"{loaded_category}_outline_records"] = loaded_payload.get(
         "outline_records", []
     )
     st.session_state["search_logs"] = loaded_payload.get("search_logs", [])
-    st.session_state["current_save_category"] = category
 
 
 # ---------------------------------------------------------------------
@@ -1650,43 +2060,43 @@ if loaded_payload:
 
 st.title("📚 Research Assistant")
 st.write(
-    "Search papers and records, screen results, keep notes, check citation "
-    "metadata, and save projects."
+    "Search research papers, historical archives, archaeological records, "
+    "scientific outputs, and historical newspapers."
 )
 
 st.info(
-    "Archive catalogue records, abstracts, and listed document links are "
-    "different things. The app does not promise that a listed document is "
-    "digitized, complete, or freely accessible."
+    "A catalogue record, abstract/OCR snippet, and listed digitized document "
+    "are different things. The app cannot guarantee that a link is complete, "
+    "readable, or freely accessible."
 )
 
-papers_tab, corporate_tab, archaeology_tab, science_tab = st.tabs(CATEGORIES)
+paper_tab, corporate_tab, archaeology_tab, science_tab, newspaper_tab = (
+    st.tabs(CATEGORIES)
+)
 
 
 # ---------------------------------------------------------------------
-# Research papers tab
+# Research Papers
 # ---------------------------------------------------------------------
 
-with papers_tab:
+with paper_tab:
     st.subheader("Research Papers")
 
     with st.form("papers_search_form"):
         query = st.text_input(
             "Research question or topic",
-            key="Research Papers_query_input",
+            key="papers_query_input",
             placeholder="Example: effects of urban green space on health",
         )
 
         c1, c2, c3 = st.columns(3)
         with c1:
             start_year = st.number_input(
-                "From year", min_value=1800, max_value=2100,
-                value=2015, key="papers_start_year",
+                "From year", 1800, 2100, 2015, key="papers_start_year"
             )
         with c2:
             end_year = st.number_input(
-                "To year", min_value=1800, max_value=2100,
-                value=2025, key="papers_end_year",
+                "To year", 1800, 2100, 2025, key="papers_end_year"
             )
         with c3:
             limit = st.slider(
@@ -1711,7 +2121,7 @@ with papers_tab:
         elif start_year > end_year:
             st.error("From year must not be later than To year.")
         else:
-            search_functions = {
+            searchers = {
                 "OpenAlex": search_openalex,
                 "Crossref": search_crossref,
                 "PubMed": search_pubmed,
@@ -1727,13 +2137,13 @@ with papers_tab:
             for source in sources:
                 try:
                     with st.spinner(f"Searching {source}..."):
-                        results = search_functions[source](
+                        results = searchers[source](
                             query, int(start_year), int(end_year), int(limit)
                         )
                     found.extend(results)
                     outcomes[source] = f"Success: {len(results)} results"
                 except Exception as exc:
-                    outcomes[source] = f"Failed: {str(exc)[:250]}"
+                    outcomes[source] = f"Failed: {str(exc)[:200]}"
                     st.warning(f"{source} search failed: {exc}")
 
             st.session_state["Research Papers_records"] = deduplicate(found)
@@ -1751,41 +2161,36 @@ with papers_tab:
                 outcomes,
             )
 
-    paper_records = st.session_state.get("Research Papers_records", [])
-    paper_question = st.session_state.get(
+    records = st.session_state.get("Research Papers_records", [])
+    query = st.session_state.get(
         "Research Papers_question",
-        st.session_state.get("Research Papers_query_input", ""),
+        st.session_state.get("papers_query_input", ""),
     )
 
-    render_records(
-        "Research Papers",
-        paper_records,
-        paper_question,
-        allow_ai=True,
-    )
+    render_records("Research Papers", records, query, allow_ai=True)
 
 
 # ---------------------------------------------------------------------
-# Corporate and historical archives tab
+# Corporate & Historical Archives
 # ---------------------------------------------------------------------
 
 with corporate_tab:
     st.subheader("Corporate & Historical Archives")
     st.write(
-        "The app directly searches the Library of Congress API. For other "
-        "institutions, it links to official catalogues rather than scraping."
+        "The app directly searches the Library of Congress API. Other "
+        "institutions are linked through their official catalogues."
     )
 
     with st.form("corporate_search_form"):
         query = st.text_input(
             "Company, organization, person, or topic",
-            key="Corporate_query_input",
+            key="corporate_query_input",
             placeholder="Example: Tata Iron and Steel Company",
         )
         limit = st.slider(
             "Library of Congress results",
             5, 50, 20,
-            key="Corporate_loc_limit",
+            key="corporate_loc_limit",
         )
         submitted = st.form_submit_button(
             "Search archives",
@@ -1796,36 +2201,34 @@ with corporate_tab:
         if not query.strip():
             st.error("Enter a company, organization, person, or topic.")
         else:
-            outcomes = {}
             try:
                 with st.spinner("Searching Library of Congress..."):
                     results = search_library_of_congress(query, int(limit))
+
                 st.session_state[
                     "Corporate & Historical Archives_records"
                 ] = results
                 st.session_state[
                     "Corporate & Historical Archives_question"
                 ] = query
-                outcomes["Library of Congress"] = (
-                    f"Success: {len(results)} results"
+
+                add_search_log(
+                    "Corporate & Historical Archives",
+                    query,
+                    ["Library of Congress API"],
+                    outcomes={
+                        "Library of Congress": f"Success: {len(results)} results"
+                    },
                 )
             except Exception as exc:
-                outcomes["Library of Congress"] = f"Failed: {str(exc)[:250]}"
                 st.warning(f"Library of Congress search failed: {exc}")
-
-            add_search_log(
-                "Corporate & Historical Archives",
-                query,
-                ["Library of Congress API"],
-                outcomes=outcomes,
-            )
 
     records = st.session_state.get(
         "Corporate & Historical Archives_records", []
     )
     query = st.session_state.get(
         "Corporate & Historical Archives_question",
-        st.session_state.get("Corporate_query_input", ""),
+        st.session_state.get("corporate_query_input", ""),
     )
 
     if records:
@@ -1841,20 +2244,20 @@ with corporate_tab:
 
 
 # ---------------------------------------------------------------------
-# Archaeology tab
+# Archaeological Records
 # ---------------------------------------------------------------------
 
 with archaeology_tab:
     st.subheader("Archaeological Records")
     st.write(
-        "This section provides official catalogue links. It does not scrape "
-        "those catalogues."
+        "This section links to official archaeology catalogues. It does not "
+        "scrape those sites."
     )
 
     with st.form("archaeology_search_form"):
         query = st.text_input(
             "Site, region, period, project, or topic",
-            key="Archaeology_query_input",
+            key="archaeology_query_input",
             placeholder="Example: Indus Valley excavation",
         )
         submitted = st.form_submit_button(
@@ -1872,13 +2275,13 @@ with archaeology_tab:
                 query,
                 ["Official catalogue links"],
                 outcomes={
-                    "Catalogue links": "Displayed; not searched by the app"
+                    "Catalogue links": "Shown; not directly searched by app"
                 },
             )
 
     query = st.session_state.get(
         "Archaeological Records_question",
-        st.session_state.get("Archaeology_query_input", ""),
+        st.session_state.get("archaeology_query_input", ""),
     )
 
     if query.strip():
@@ -1886,7 +2289,7 @@ with archaeology_tab:
 
 
 # ---------------------------------------------------------------------
-# Scientific records tab
+# Scientific Journals & Records
 # ---------------------------------------------------------------------
 
 with science_tab:
@@ -1895,20 +2298,18 @@ with science_tab:
     with st.form("science_search_form"):
         query = st.text_input(
             "Scientific topic or research-output query",
-            key="Science_query_input",
+            key="science_query_input",
             placeholder="Example: climate change crop yield dataset",
         )
 
         c1, c2, c3 = st.columns(3)
         with c1:
             start_year = st.number_input(
-                "From year", min_value=1800, max_value=2100,
-                value=2015, key="science_start_year",
+                "From year", 1800, 2100, 2015, key="science_start_year"
             )
         with c2:
             end_year = st.number_input(
-                "To year", min_value=1800, max_value=2100,
-                value=2025, key="science_end_year",
+                "To year", 1800, 2100, 2025, key="science_end_year"
             )
         with c3:
             limit = st.slider(
@@ -1939,7 +2340,7 @@ with science_tab:
         elif start_year > end_year:
             st.error("From year must not be later than To year.")
         else:
-            search_functions = {
+            searchers = {
                 "OpenAlex": search_openalex,
                 "Crossref": search_crossref,
                 "PubMed": search_pubmed,
@@ -1955,13 +2356,13 @@ with science_tab:
             for source in sources:
                 try:
                     with st.spinner(f"Searching {source}..."):
-                        results = search_functions[source](
+                        results = searchers[source](
                             query, int(start_year), int(end_year), int(limit)
                         )
                     found.extend(results)
                     outcomes[source] = f"Success: {len(results)} results"
                 except Exception as exc:
-                    outcomes[source] = f"Failed: {str(exc)[:250]}"
+                    outcomes[source] = f"Failed: {str(exc)[:200]}"
                     st.warning(f"{source} search failed: {exc}")
 
             st.session_state[
@@ -1992,7 +2393,7 @@ with science_tab:
     )
     query = st.session_state.get(
         "Scientific Journals & Records_question",
-        st.session_state.get("Science_query_input", ""),
+        st.session_state.get("science_query_input", ""),
     )
 
     render_records(
@@ -2003,18 +2404,156 @@ with science_tab:
     )
 
     if query.strip():
+        show_catalogue_links(query, "Scientific Journals & Records")
+
+
+# ---------------------------------------------------------------------
+# Historical Newspapers
+# ---------------------------------------------------------------------
+
+with newspaper_tab:
+    st.subheader("Historical Newspapers")
+    st.write(
+        "Search Internet Archive and Library of Congress directly. "
+        "Europeana search uses your API key. Trove search becomes available "
+        "when you add its API key."
+    )
+
+    with st.form("newspaper_search_form"):
+        query = st.text_input(
+            "Newspaper title, place, date, language, or topic",
+            key="newspaper_query_input",
+            placeholder="Example: 1910 Bombay newspaper",
+        )
+
+        limit = st.slider(
+            "Results per direct-search source",
+            5,
+            50,
+            20,
+            key="newspaper_limit",
+        )
+
+        selected_sources = st.multiselect(
+            "Newspaper sources to search",
+            [
+                "Internet Archive",
+                "Library of Congress",
+                "Europeana",
+                "Trove",
+            ],
+            default=[
+                "Internet Archive",
+                "Library of Congress",
+                "Europeana",
+            ],
+            key="newspaper_sources",
+        )
+
+        submitted = st.form_submit_button(
+            "Search historical newspapers",
+            type="primary",
+        )
+
+    if submitted:
+        if not query.strip():
+            st.error("Enter a newspaper title, place, date, language, or topic.")
+        else:
+            found = []
+            outcomes = {}
+
+            for source in selected_sources:
+                try:
+                    with st.spinner(f"Searching {source}..."):
+                        if source == "Internet Archive":
+                            results = search_internet_archive_newspapers(
+                                query, int(limit)
+                            )
+                        elif source == "Library of Congress":
+                            results = search_library_of_congress(
+                                query,
+                                int(limit),
+                                newspaper_only=True,
+                            )
+                        elif source == "Europeana":
+                            api_key = get_secret("EUROPEANA_API_KEY")
+                            results = search_europeana_newspapers(
+                                query,
+                                int(limit),
+                                api_key,
+                            )
+                        elif source == "Trove":
+                            api_key = get_secret("TROVE_API_KEY")
+                            results = search_trove_newspapers(
+                                query,
+                                int(limit),
+                                api_key,
+                            )
+                        else:
+                            results = []
+
+                    found.extend(results)
+                    outcomes[source] = f"Success: {len(results)} results"
+
+                except Exception as exc:
+                    outcomes[source] = f"Failed: {str(exc)[:200]}"
+                    st.warning(f"{source} search failed: {exc}")
+
+            st.session_state["Historical Newspapers_records"] = deduplicate(found)
+            st.session_state["Historical Newspapers_question"] = query
+
+            add_search_log(
+                "Historical Newspapers",
+                query,
+                selected_sources,
+                limit=int(limit),
+                outcomes=outcomes,
+            )
+
+    newspaper_records = st.session_state.get(
+        "Historical Newspapers_records", []
+    )
+    newspaper_query = st.session_state.get(
+        "Historical Newspapers_question",
+        st.session_state.get("newspaper_query_input", ""),
+    )
+
+    if newspaper_records:
+        render_records(
+            "Historical Newspapers",
+            newspaper_records,
+            newspaper_query,
+            allow_ai=False,
+        )
+    else:
+        st.caption(
+            "Search results will appear here. If Europeana or Trove is "
+            "selected without a valid API key, that source will show a warning."
+        )
+
+    if newspaper_query.strip():
         show_catalogue_links(
-            query,
-            "Scientific Journals & Records",
+            newspaper_query,
+            "Historical Newspapers",
         )
 
 
 # ---------------------------------------------------------------------
-# Search log and Supabase project save/load
+# Project logs and saving
 # ---------------------------------------------------------------------
 
 st.divider()
-show_search_logs()
+
+with st.expander("Reproducible search log"):
+    logs = st.session_state.get("search_logs", [])
+    if logs:
+        st.dataframe(
+            pd.DataFrame(logs),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("No searches logged in this project yet.")
 
 st.subheader("Save project to Supabase")
 
@@ -2056,8 +2595,6 @@ if st.button("Save project"):
         try:
             save_project(project_name.strip(), payload)
             st.session_state["loaded_project_name"] = project_name.strip()
-            st.success(
-                f"Project saved to Supabase: {project_name.strip()}"
-            )
+            st.success(f"Project saved to Supabase: {project_name.strip()}")
         except Exception as exc:
-            st.error(f"Could not save to Supabase: {exc}")
+            st.error(f"Could not save project to Supabase: {exc}")
