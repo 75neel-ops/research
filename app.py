@@ -1,9 +1,6 @@
 import html
 import json
-import os
 import re
-import sqlite3
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -12,9 +9,9 @@ import requests
 import streamlit as st
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # App configuration
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 st.set_page_config(
     page_title="Research Assistant",
@@ -23,7 +20,6 @@ st.set_page_config(
 )
 
 HEADERS = {"User-Agent": "ResearchAssistant/1.0"}
-DB_PATH = "research_projects.db"
 
 PAPER_SOURCES = [
     "OpenAlex",
@@ -35,91 +31,148 @@ PAPER_SOURCES = [
     "DataCite",
 ]
 
+CATEGORIES = [
+    "Research Papers",
+    "Corporate & Historical Archives",
+    "Archaeological Records",
+    "Scientific Journals & Records",
+]
 
-# ---------------------------------------------------------------------------
-# Secrets and saved projects
-# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Secrets and access gate
+# ---------------------------------------------------------------------
 
 def get_secret(name):
-    """Read a key from Streamlit secrets or environment variables."""
+    """Read a value from Streamlit Secrets, or from environment variables."""
     try:
         value = st.secrets.get(name, "")
     except Exception:
         value = ""
 
-    return value or os.getenv(name, "")
+    return value or __import__("os").getenv(name, "")
 
 
-def init_project_db():
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS projects (
-                name TEXT PRIMARY KEY,
-                updated_at TEXT NOT NULL,
-                payload TEXT NOT NULL
-            )
-            """
+app_password = get_secret("APP_PASSWORD")
+
+if not app_password:
+    st.error(
+        "The app is not configured. Add APP_PASSWORD in "
+        "Streamlit → Manage app → Settings → Secrets."
+    )
+    st.stop()
+
+if not st.session_state.get("authenticated", False):
+    st.title("📚 Research Assistant")
+    st.write("Enter the app password to continue.")
+
+    entered_password = st.text_input(
+        "App password",
+        type="password",
+    )
+
+    if st.button("Continue", type="primary"):
+        if entered_password == app_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("That password is not correct.")
+
+    st.stop()
+
+
+# ---------------------------------------------------------------------
+# Supabase storage
+# ---------------------------------------------------------------------
+
+def supabase_config():
+    url = get_secret("SUPABASE_URL").rstrip("/")
+    key = get_secret("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not url or not key:
+        raise RuntimeError(
+            "Supabase is not configured. Add SUPABASE_URL and "
+            "SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets."
         )
-        connection.commit()
+
+    return url, key
+
+
+def supabase_request(method, path, params=None, json_body=None, prefer=None):
+    url, key = supabase_config()
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    if prefer:
+        headers["Prefer"] = prefer
+
+    response = requests.request(
+        method=method,
+        url=f"{url}/rest/v1/{path}",
+        headers=headers,
+        params=params,
+        json=json_body,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    if not response.content:
+        return None
+
+    return response.json()
 
 
 def list_projects():
-    init_project_db()
-
-    with sqlite3.connect(DB_PATH) as connection:
-        rows = connection.execute(
-            "SELECT name FROM projects ORDER BY name"
-        ).fetchall()
-
-    return [row[0] for row in rows]
+    rows = supabase_request(
+        "GET",
+        "research_workspaces",
+        params={"select": "id", "order": "id.asc"},
+    )
+    return [row["id"] for row in rows]
 
 
 def save_project(name, payload):
-    init_project_db()
-
-    updated_at = datetime.now(timezone.utc).isoformat()
-
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute(
-            """
-            INSERT INTO projects (name, updated_at, payload)
-            VALUES (?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                updated_at = excluded.updated_at,
-                payload = excluded.payload
-            """,
-            (name, updated_at, json.dumps(payload)),
-        )
-        connection.commit()
+    supabase_request(
+        "POST",
+        "research_workspaces",
+        params={"on_conflict": "id"},
+        json_body={
+            "id": name,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "data": payload,
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
 
 
 def load_project(name):
-    init_project_db()
-
-    with sqlite3.connect(DB_PATH) as connection:
-        row = connection.execute(
-            "SELECT payload FROM projects WHERE name = ?",
-            (name,),
-        ).fetchone()
-
-    return json.loads(row[0]) if row else None
+    rows = supabase_request(
+        "GET",
+        "research_workspaces",
+        params={
+            "select": "data",
+            "id": f"eq.{name}",
+            "limit": "1",
+        },
+    )
+    return rows[0]["data"] if rows else None
 
 
 def delete_project(name):
-    init_project_db()
-
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute(
-            "DELETE FROM projects WHERE name = ?",
-            (name,),
-        )
-        connection.commit()
+    supabase_request(
+        "DELETE",
+        "research_workspaces",
+        params={"id": f"eq.{name}"},
+    )
 
 
-# ---------------------------------------------------------------------------
-# Shared record helpers
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------
 
 def clean_text(value):
     if not value:
@@ -147,7 +200,7 @@ def make_record(
     abstract = clean_text(abstract)
 
     if full_text_url:
-        access_status = "Full-text link listed (not verified)"
+        access_status = "Full-text/document link listed; not verified"
     elif abstract:
         access_status = "Abstract or description available"
     else:
@@ -167,37 +220,41 @@ def make_record(
         "doi": doi or "",
         "type": record_type or "",
         "citations": citations or "",
+        "screening": "Unscreened",
+        "screening_reason": "",
+        "tags": "",
+        "researcher_notes": "",
     }
 
 
 def normalize_doi(value):
     value = (value or "").strip().lower()
-    value = value.replace("https://doi.org/", "")
-    value = value.replace("http://doi.org/", "")
-    value = value.replace("doi:", "")
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        value = value.replace(prefix, "")
     return value
 
 
 def deduplicate(records):
-    combined = {}
+    """Merge duplicate search results using DOI first, then title."""
+    merged = {}
 
     for record in records:
-        doi_key = normalize_doi(record.get("doi"))
-        title_key = re.sub(
+        doi = normalize_doi(record.get("doi"))
+        title = re.sub(
             r"\W+",
             " ",
             (record.get("title") or "").lower(),
         ).strip()
+        key = doi or title
 
-        key = doi_key or title_key
         if not key:
             continue
 
-        if key not in combined:
-            combined[key] = record.copy()
+        if key not in merged:
+            merged[key] = record.copy()
             continue
 
-        existing = combined[key]
+        existing = merged[key]
 
         for field in [
             "authors",
@@ -217,38 +274,44 @@ def deduplicate(records):
         if len(record.get("abstract", "")) > len(existing.get("abstract", "")):
             existing["abstract"] = record["abstract"]
 
-        sources = {
-            item.strip()
-            for item in (
+        source_names = {
+            name.strip()
+            for name in (
                 (existing.get("database", "") + "," +
                  record.get("database", "")).split(",")
             )
-            if item.strip()
+            if name.strip()
         }
-        existing["database"] = ", ".join(sorted(sources))
+        existing["database"] = ", ".join(sorted(source_names))
 
         if existing.get("full_text_url"):
-            existing["access_status"] = "Full-text link listed (not verified)"
+            existing["access_status"] = (
+                "Full-text/document link listed; not verified"
+            )
         elif existing.get("abstract"):
             existing["access_status"] = "Abstract or description available"
         else:
             existing["access_status"] = "Catalogue/record link only"
 
-    return list(combined.values())
+    return list(merged.values())
 
 
-def year_is_in_range(year, start_year, end_year):
+def year_in_range(year, start_year, end_year):
     try:
-        value = int(str(year)[:4])
-        return int(start_year) <= value <= int(end_year)
+        year_value = int(str(year)[:4])
+        return int(start_year) <= year_value <= int(end_year)
     except (ValueError, TypeError):
-        # Keep records with no parseable year; show the missing date clearly.
+        # Retain records whose provider did not supply a usable year.
         return True
 
 
-# ---------------------------------------------------------------------------
-# Research-paper source searches
-# ---------------------------------------------------------------------------
+def current_timestamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+# ---------------------------------------------------------------------
+# Search APIs: research and scientific records
+# ---------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_openalex(query, start_year, end_year, limit):
@@ -268,7 +331,7 @@ def search_openalex(query, start_year, end_year, limit):
             ),
         },
         headers=HEADERS,
-        timeout=40,
+        timeout=45,
     )
     response.raise_for_status()
 
@@ -293,8 +356,10 @@ def search_openalex(query, start_year, end_year, limit):
             if author.get("display_name"):
                 authors.append(author["display_name"])
 
-        location = item.get("primary_location") or {}
-        venue = (location.get("source") or {}).get("display_name", "")
+        primary_location = item.get("primary_location") or {}
+        venue = (
+            (primary_location.get("source") or {}).get("display_name", "")
+        )
 
         oa_location = item.get("best_oa_location") or {}
         full_text_url = (
@@ -340,7 +405,7 @@ def search_crossref(query, start_year, end_year, limit):
             ),
         },
         headers=HEADERS,
-        timeout=40,
+        timeout=45,
     )
     response.raise_for_status()
 
@@ -352,10 +417,12 @@ def search_crossref(query, start_year, end_year, limit):
 
         for author in item.get("author", []):
             name = " ".join(
-                part for part in [
+                part
+                for part in [
                     author.get("given", ""),
                     author.get("family", ""),
-                ] if part
+                ]
+                if part
             )
             if name:
                 authors.append(name)
@@ -372,10 +439,8 @@ def search_crossref(query, start_year, end_year, limit):
 
         pdf_url = ""
         for link in item.get("link", []):
-            if (
-                "pdf" in (link.get("content-type") or "").lower()
-                and link.get("URL")
-            ):
+            content_type = (link.get("content-type") or "").lower()
+            if "pdf" in content_type and link.get("URL"):
                 pdf_url = link["URL"]
                 break
 
@@ -412,7 +477,7 @@ def search_pubmed(query, start_year, end_year, limit):
             "retmode": "json",
         },
         headers=HEADERS,
-        timeout=40,
+        timeout=45,
     )
     search_response.raise_for_status()
 
@@ -432,7 +497,7 @@ def search_pubmed(query, start_year, end_year, limit):
             "retmode": "xml",
         },
         headers=HEADERS,
-        timeout=40,
+        timeout=45,
     )
     fetch_response.raise_for_status()
 
@@ -476,7 +541,8 @@ def search_pubmed(query, start_year, end_year, limit):
 
         full_text_url = (
             f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/"
-            if pmc_id else ""
+            if pmc_id
+            else ""
         )
 
         records.append(
@@ -598,7 +664,7 @@ def search_arxiv(query, start_year, end_year, limit):
         )
         year = published[:4] if published else ""
 
-        if year and not year_is_in_range(year, start_year, end_year):
+        if year and not year_in_range(year, start_year, end_year):
             continue
 
         authors = [
@@ -617,7 +683,7 @@ def search_arxiv(query, start_year, end_year, limit):
         records.append(
             make_record(
                 title=title,
-                authors=", ".join(a for a in authors if a),
+                authors=", ".join(author for author in authors if author),
                 year=year,
                 abstract=abstract,
                 url=record_url,
@@ -639,11 +705,12 @@ def search_doaj(query, start_year, end_year, limit):
         "https://doaj.org/api/search/articles/"
         f"{quote(query, safe='')}"
     )
+
     response = requests.get(
         endpoint,
         params={"page": 1, "pageSize": limit},
         headers=HEADERS,
-        timeout=40,
+        timeout=45,
     )
     response.raise_for_status()
 
@@ -653,7 +720,7 @@ def search_doaj(query, start_year, end_year, limit):
         bib = result.get("bibjson", {})
         year = bib.get("year", "")
 
-        if year and not year_is_in_range(year, start_year, end_year):
+        if year and not year_in_range(year, start_year, end_year):
             continue
 
         authors = [
@@ -661,8 +728,8 @@ def search_doaj(query, start_year, end_year, limit):
             for author in bib.get("author", [])
             if author.get("name")
         ]
-
         links = bib.get("link", [])
+
         full_text_url = next(
             (
                 link.get("url", "")
@@ -713,7 +780,7 @@ def search_datacite(query, start_year, end_year, limit):
             "sort": "published",
         },
         headers=HEADERS,
-        timeout=40,
+        timeout=45,
     )
     response.raise_for_status()
 
@@ -721,27 +788,29 @@ def search_datacite(query, start_year, end_year, limit):
 
     for item in response.json().get("data", []):
         attributes = item.get("attributes", {})
-        year = (
-            attributes.get("publicationYear")
-            or (attributes.get("published") or "")[:4]
-        )
+        year = attributes.get("publicationYear") or ""
 
-        if year and not year_is_in_range(year, start_year, end_year):
+        if year and not year_in_range(year, start_year, end_year):
             continue
 
         titles = attributes.get("titles") or []
         title = titles[0].get("title", "") if titles else ""
 
-        creators = []
-        for creator in attributes.get("creators", []):
-            name = creator.get("name")
-            if name:
-                creators.append(name)
+        creators = [
+            creator.get("name", "")
+            for creator in attributes.get("creators", [])
+            if creator.get("name")
+        ]
 
         doi = attributes.get("doi", "")
         doi_url = f"https://doi.org/{doi}" if doi else ""
+
         descriptions = attributes.get("descriptions") or []
-        abstract = descriptions[0].get("description", "") if descriptions else ""
+        abstract = (
+            descriptions[0].get("description", "")
+            if descriptions
+            else ""
+        )
 
         records.append(
             make_record(
@@ -753,74 +822,70 @@ def search_datacite(query, start_year, end_year, limit):
                 venue=attributes.get("publisher", ""),
                 source="DataCite",
                 doi=doi_url,
-                record_type=", ".join(attributes.get("types", {}).values()),
-                access_notes="Research output metadata; access depends on the provider.",
+                record_type="Research output or dataset",
+                access_notes=(
+                    "Metadata is available; access to the underlying output "
+                    "depends on its provider."
+                ),
             )
         )
 
     return records
 
 
-# ---------------------------------------------------------------------------
-# Library of Congress official API
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Library of Congress API and official catalogue links
+# ---------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_library_of_congress(query, limit):
     response = requests.get(
         "https://www.loc.gov/search/",
-        params={
-            "fo": "json",
-            "q": query,
-            "c": limit,
-        },
+        params={"fo": "json", "q": query, "c": limit},
         headers=HEADERS,
-        timeout=40,
+        timeout=45,
     )
     response.raise_for_status()
 
     records = []
 
     for item in response.json().get("results", []):
-        title = item.get("title", "")
-        item_url = item.get("url", "")
-        date_text = item.get("date", "")
-
         descriptions = item.get("description") or []
         if isinstance(descriptions, str):
             descriptions = [descriptions]
-        description = " ".join(str(x) for x in descriptions)
 
-        # LOC records may list digitized resources in these fields.
         resources = item.get("resources") or []
         online_formats = item.get("online_format") or []
-        image_url = item.get("image_url") or []
+        image_urls = item.get("image_url") or []
 
-        full_text_url = ""
-        if resources:
-            first_resource = resources[0]
-            if isinstance(first_resource, dict):
-                full_text_url = (
-                    first_resource.get("url")
-                    or first_resource.get("image_url")
-                    or ""
-                )
+        listed_url = ""
+
+        if resources and isinstance(resources[0], dict):
+            listed_url = (
+                resources[0].get("url")
+                or resources[0].get("image_url")
+                or ""
+            )
         elif online_formats:
             first_format = online_formats[0]
             if isinstance(first_format, dict):
-                full_text_url = first_format.get("url", "")
+                listed_url = first_format.get("url", "")
             elif isinstance(first_format, str):
-                full_text_url = first_format
-        elif image_url:
-            full_text_url = image_url[0] if isinstance(image_url, list) else image_url
+                listed_url = first_format
+        elif image_urls:
+            listed_url = (
+                image_urls[0]
+                if isinstance(image_urls, list)
+                else image_urls
+            )
 
         records.append(
             make_record(
-                title=title,
-                year=date_text,
-                abstract=description,
-                url=item_url,
-                full_text_url=full_text_url,
+                title=item.get("title", ""),
+                year=item.get("date", ""),
+                abstract=" ".join(str(value) for value in descriptions),
+                url=item.get("url", ""),
+                full_text_url=listed_url,
                 source="Library of Congress",
                 record_type="Library/archive catalogue record",
                 access_notes=(
@@ -833,325 +898,196 @@ def search_library_of_congress(query, limit):
     return records
 
 
-# ---------------------------------------------------------------------------
-# Official catalogue links (no scraping)
-# ---------------------------------------------------------------------------
-
-def catalogue_links(query, category):
-    encoded = quote(query.strip())
+def official_catalogue_links(query, category):
+    encoded = quote((query or "").strip())
 
     if category == "Corporate & Historical Archives":
         return [
-            {
-                "institution": "National Archives of India — Abhilekh Patal",
-                "country": "India",
-                "url": "https://abhilekh-patal.in/",
-                "note": (
-                    "Official catalogue portal. Search availability and "
-                    "digitization vary by collection."
-                ),
-            },
-            {
-                "institution": "Tata Central Archives",
-                "country": "India",
-                "url": "https://www.tatacentralarchives.com/",
-                "note": (
-                    "Institutional archive information. Check its official "
-                    "site for collection access and research procedures."
-                ),
-            },
-            {
-                "institution": "National Archives Catalog (NARA)",
-                "country": "United States",
-                "url": (
-                    "https://catalog.archives.gov/search?"
-                    f"query={encoded}"
-                ),
-                "note": (
-                    "Search the official NARA catalogue. Results may describe "
-                    "records that require an archive visit or request."
-                ),
-            },
-            {
-                "institution": "Library of Congress",
-                "country": "United States",
-                "url": f"https://www.loc.gov/search/?q={encoded}",
-                "note": "Official catalogue search. Digital access varies.",
-            },
-            {
-                "institution": "The National Archives — Discovery",
-                "country": "United Kingdom",
-                "url": (
+            (
+                "National Archives of India — Abhilekh Patal",
+                "India",
+                "https://abhilekh-patal.in/",
+                "Official portal; collection search and digitization vary.",
+            ),
+            (
+                "Tata Central Archives",
+                "India",
+                "https://www.tatacentralarchives.com/",
+                "Check the institution's site for collections and access.",
+            ),
+            (
+                "Godrej Archives",
+                "India",
+                "https://www.godrej.com/godrej-archives",
+                "Check the institution's site for collections and access.",
+            ),
+            (
+                "National Archives Catalog (NARA)",
+                "United States",
+                f"https://catalog.archives.gov/search?query={encoded}",
+                "Catalogue records may require an archive visit or request.",
+            ),
+            (
+                "Library of Congress",
+                "United States",
+                f"https://www.loc.gov/search/?q={encoded}",
+                "The app can search LOC using its official API.",
+            ),
+            (
+                "The National Archives — Discovery",
+                "United Kingdom",
+                (
                     "https://discovery.nationalarchives.gov.uk/results/"
                     f"r?_q={encoded}"
                 ),
-                "note": (
-                    "Official UK archive catalogue. Many records are "
-                    "catalogue descriptions rather than online documents."
-                ),
-            },
-            {
-                "institution": "Archives Hub",
-                "country": "United Kingdom",
-                "url": (
-                    "https://archiveshub.jisc.ac.uk/search/?terms="
-                    f"{encoded}"
-                ),
-                "note": (
-                    "Search descriptions of archival collections held by "
-                    "participating UK repositories."
-                ),
-            },
-            {
-                "institution": "Godrej Archives",
-                "country": "India",
-                "url": "https://www.godrej.com/godrej-archives",
-                "note": (
-                    "Use the institution's official site for collection "
-                    "information and access arrangements."
-                ),
-            },
+                "Catalogue descriptions do not necessarily link to digitized files.",
+            ),
+            (
+                "Archives Hub",
+                "United Kingdom",
+                f"https://archiveshub.jisc.ac.uk/search/?terms={encoded}",
+                "Search descriptions from participating archive repositories.",
+            ),
         ]
 
     if category == "Archaeological Records":
         return [
-            {
-                "institution": "Archaeology Data Service (ADS)",
-                "country": "United Kingdom",
-                "url": "https://archaeologydataservice.ac.uk/",
-                "note": (
-                    "Official ADS site. Search and access options depend on "
-                    "the dataset or archive record."
-                ),
-            },
-            {
-                "institution": "Open Context",
-                "country": "International",
-                "url": "https://opencontext.org/",
-                "note": (
-                    "Archaeological data and publication platform. Follow "
-                    "its site search and record-level access terms."
-                ),
-            },
-            {
-                "institution": "tDAR — Digital Archaeological Record",
-                "country": "United States / International",
-                "url": "https://www.tdar.org/",
-                "note": (
-                    "Digital archaeological records; some materials may have "
-                    "access restrictions."
-                ),
-            },
-            {
-                "institution": "Archaeological Survey of India",
-                "country": "India",
-                "url": "https://asi.nic.in/",
-                "note": (
-                    "Official ASI website. Use its published resources and "
-                    "contact information for access."
-                ),
-            },
-            {
-                "institution": "Library of Congress",
-                "country": "United States",
-                "url": f"https://www.loc.gov/search/?q={encoded}",
-                "note": (
-                    "The app also searches LOC's official API for catalogue "
-                    "records matching this query."
-                ),
-            },
+            (
+                "Archaeology Data Service",
+                "United Kingdom",
+                "https://archaeologydataservice.ac.uk/",
+                "Search the official service; access varies by record.",
+            ),
+            (
+                "Open Context",
+                "International",
+                "https://opencontext.org/",
+                "Archaeological data and publication platform.",
+            ),
+            (
+                "tDAR — Digital Archaeological Record",
+                "United States / International",
+                "https://www.tdar.org/",
+                "Some records or files may have access restrictions.",
+            ),
+            (
+                "Archaeological Survey of India",
+                "India",
+                "https://asi.nic.in/",
+                "Use the official site for published resources and contacts.",
+            ),
+            (
+                "Library of Congress",
+                "United States",
+                f"https://www.loc.gov/search/?q={encoded}",
+                "The app can search LOC using its official API.",
+            ),
         ]
 
     if category == "Scientific Journals & Records":
         return [
-            {
-                "institution": "OpenAlex",
-                "country": "International",
-                "url": f"https://openalex.org/works?search={encoded}",
-                "note": "Scholarly works metadata and links.",
-            },
-            {
-                "institution": "Crossref",
-                "country": "International",
-                "url": (
-                    "https://search.crossref.org/?q="
-                    f"{encoded}"
-                ),
-                "note": "Publication metadata and DOI records.",
-            },
-            {
-                "institution": "DataCite",
-                "country": "International",
-                "url": (
-                    "https://commons.datacite.org/"
-                    f"?query={encoded}"
-                ),
-                "note": "Research datasets and other registered outputs.",
-            },
+            (
+                "OpenAlex",
+                "International",
+                f"https://openalex.org/works?search={encoded}",
+                "Scholarly works metadata and source links.",
+            ),
+            (
+                "Crossref",
+                "International",
+                f"https://search.crossref.org/?q={encoded}",
+                "Publication metadata and DOI records.",
+            ),
+            (
+                "DataCite",
+                "International",
+                f"https://commons.datacite.org/?query={encoded}",
+                "Research datasets and other registered research outputs.",
+            ),
         ]
 
     return []
 
 
-# ---------------------------------------------------------------------------
-# AI outline generation
-# ---------------------------------------------------------------------------
-
-def generate_outline(question, records):
-    openai_key = get_secret("OPENAI_API_KEY")
-    gemini_key = get_secret("GEMINI_API_KEY")
-
-    if not openai_key and not gemini_key:
-        raise ValueError(
-            "Add OPENAI_API_KEY or GEMINI_API_KEY in Streamlit "
-            "Settings → Secrets to generate an outline."
-        )
-
-    source_lines = []
-
-    for index, record in enumerate(records, start=1):
-        source_lines.append(
-            f"[S{index}] {record.get('title', 'Untitled')}\n"
-            f"Authors: {record.get('authors') or 'Not listed'}\n"
-            f"Year: {record.get('year') or 'Not listed'}\n"
-            f"Abstract/description: "
-            f"{(record.get('abstract') or 'Not provided')[:1500]}\n"
-            f"Link: {record.get('url') or 'Not listed'}\n"
-            f"Access label: {record.get('access_status', '')}"
-        )
-
-    prompt = f"""
-Research question: {question}
-
-Prepare a cautious literature-review outline using only the source
-information below.
-
-Rules:
-- Group relevant sources into themes.
-- Cite claims with source IDs such as [S1].
-- Do not invent findings, methods, authors, or citations.
-- Say when the supplied abstract or description is insufficient.
-- Do not claim to have read full text based only on a link.
-- This is a draft outline for a researcher to verify.
-
-Sources:
-{chr(10).join(source_lines)}
-"""
-
-    # Use OpenAI if both keys are present, because it is the preferred
-    # provider in this app. Gemini is used if no OpenAI key is configured.
-    if openai_key:
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {openai_key}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a cautious research assistant. "
-                            "Use only supplied source information."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2,
-            },
-            timeout=90,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-
-    model = get_secret("GEMINI_MODEL") or "gemini-2.5-flash"
-
-    response = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{model}:generateContent",
-        params={"key": gemini_key},
-        json={
-            "systemInstruction": {
-                "parts": [{
-                    "text": (
-                        "You are a cautious research assistant. "
-                        "Use only supplied source information."
-                    )
-                }]
-            },
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2},
-        },
-        timeout=90,
+def show_catalogue_links(query, category):
+    st.markdown("#### Official catalogue links")
+    st.caption(
+        "These are links to official institution sites. The app does not "
+        "scrape them. Catalogue records do not guarantee digitized or "
+        "free-to-access documents."
     )
-    response.raise_for_status()
 
-    data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
-
-
-# ---------------------------------------------------------------------------
-# Citation and export helpers
-# ---------------------------------------------------------------------------
-
-def linkify_citations(text, records):
-    def replace(match):
-        number = int(match.group(1))
-        index = number - 1
-
-        if index < 0 or index >= len(records):
-            return match.group(0)
-
-        url = records[index].get("url")
-        return f"[S{number}]({url})" if url else match.group(0)
-
-    return re.sub(r"\[S(\d+)\]", replace, text)
+    for institution, country, url, note in official_catalogue_links(
+        query, category
+    ):
+        st.markdown(
+            f"**{institution}** ({country})  \n"
+            f"[Open official catalogue/site]({url})  \n"
+            f"{note}"
+        )
 
 
-def make_reference_list(records):
-    lines = ["## References"]
+# ---------------------------------------------------------------------
+# Citation checks, screening, exports, AI
+# ---------------------------------------------------------------------
 
-    for index, record in enumerate(records, start=1):
-        authors = record.get("authors") or "Authors not listed"
-        year = record.get("year") or "Date not listed"
-        title = record.get("title") or "Untitled"
-        venue = record.get("venue") or ""
-        url = record.get("url") or ""
+def citation_issues(record):
+    issues = []
 
-        reference = f"[S{index}] {authors} ({year}). *{title}*."
-        if venue:
-            reference += f" {venue}."
-        if url:
-            reference += f" [Open record]({url})"
+    if not record.get("title"):
+        issues.append("Missing title")
+    if not record.get("authors"):
+        issues.append("Authors not supplied")
+    if not record.get("year"):
+        issues.append("Year/date not supplied")
+    if not record.get("url"):
+        issues.append("No record URL")
+    if not record.get("doi"):
+        issues.append("No DOI supplied")
 
-        lines.append(reference)
+    return issues
 
-    return "\n".join(lines)
+
+def citation_quality_summary(records):
+    if not records:
+        return
+
+    issue_count = sum(bool(citation_issues(record)) for record in records)
+    st.caption(
+        f"Citation metadata check: {issue_count} of {len(records)} records "
+        "have one or more missing fields. This flags incomplete metadata; "
+        "it does not verify citation accuracy."
+    )
 
 
 def make_bibtex(records):
     entries = []
 
     for index, record in enumerate(records, start=1):
-        authors = record.get("authors") or ""
-        first_author = authors.split(",")[0] if authors else "source"
-        last_name = re.sub(r"[^A-Za-z0-9]", "", first_author.split()[-1])
+        author_text = record.get("authors") or ""
+        first_author = author_text.split(",")[0] if author_text else "source"
+        last_name = re.sub(
+            r"[^A-Za-z0-9]",
+            "",
+            first_author.split()[-1],
+        )
         year = str(record.get("year") or "nd")
-        citation_key = f"{last_name or 'source'}{year}{index}"
+        key = f"{last_name or 'source'}{year}{index}"
 
         fields = {
             "title": record.get("title", ""),
-            "author": authors,
-            "year": record.get("year", ""),
+            "author": author_text,
+            "year": year if year != "nd" else "",
             "journal": record.get("venue", ""),
             "doi": normalize_doi(record.get("doi", "")),
             "url": record.get("url", ""),
         }
 
-        lines = [f"@misc{{{citation_key},"]
-        for key, value in fields.items():
+        lines = [f"@misc{{{key},"]
+        for field, value in fields.items():
             if value:
-                safe_value = str(value).replace("{", "").replace("}", "")
-                lines.append(f"  {key} = {{{safe_value}}},")
+                value = str(value).replace("{", "").replace("}", "")
+                lines.append(f"  {field} = {{{value}}},")
         lines.append("}")
         entries.append("\n".join(lines))
 
@@ -1204,27 +1140,156 @@ def make_markdown(question, records, outline=""):
     for index, record in enumerate(records, start=1):
         title = record.get("title") or "Untitled"
         url = record.get("url") or ""
-        lines.append(f"{index}. [{title}]({url})" if url else f"{index}. {title}")
+
+        lines.append(
+            f"{index}. [{title}]({url})" if url else f"{index}. {title}"
+        )
+        lines.append(f"   - Authors: {record.get('authors') or 'Not listed'}")
         lines.append(f"   - Date/year: {record.get('year') or 'Not listed'}")
         lines.append(f"   - Source: {record.get('database') or 'Not listed'}")
         lines.append(f"   - Access: {record.get('access_status') or 'Not listed'}")
 
         if record.get("full_text_url"):
             lines.append(
-                f"   - Listed full-text link: {record['full_text_url']}"
+                f"   - Listed document link: {record['full_text_url']}"
             )
         if record.get("abstract"):
-            lines.append(f"   - Description: {record['abstract']}")
+            lines.append(f"   - Abstract/description: {record['abstract']}")
         lines.append("")
 
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# UI helpers
-# ---------------------------------------------------------------------------
+def linkify_citations(text, records):
+    def replace(match):
+        number = int(match.group(1))
+        position = number - 1
 
-def filter_and_sort_records(records, key_prefix):
+        if position < 0 or position >= len(records):
+            return match.group(0)
+
+        url = records[position].get("url")
+        return f"[S{number}]({url})" if url else match.group(0)
+
+    return re.sub(r"\[S(\d+)\]", replace, text)
+
+
+def make_reference_list(records):
+    lines = ["#### References"]
+
+    for index, record in enumerate(records, start=1):
+        authors = record.get("authors") or "Authors not listed"
+        year = record.get("year") or "Date not listed"
+        title = record.get("title") or "Untitled"
+        venue = record.get("venue") or ""
+        url = record.get("url") or ""
+
+        text = f"[S{index}] {authors} ({year}). *{title}*."
+        if venue:
+            text += f" {venue}."
+        if url:
+            text += f" [Open record]({url})"
+        lines.append(text)
+
+    return "\n".join(lines)
+
+
+def generate_outline(question, records):
+    openai_key = get_secret("OPENAI_API_KEY")
+    gemini_key = get_secret("GEMINI_API_KEY")
+
+    if not openai_key and not gemini_key:
+        raise RuntimeError(
+            "Add OPENAI_API_KEY or GEMINI_API_KEY to Streamlit Secrets "
+            "to use AI summaries."
+        )
+
+    source_blocks = []
+
+    for index, record in enumerate(records, start=1):
+        source_blocks.append(
+            f"[S{index}] {record.get('title', 'Untitled')}\n"
+            f"Authors: {record.get('authors') or 'Not supplied'}\n"
+            f"Year: {record.get('year') or 'Not supplied'}\n"
+            f"Abstract/description: "
+            f"{(record.get('abstract') or 'Not supplied')[:1600]}\n"
+            f"Record URL: {record.get('url') or 'Not supplied'}\n"
+            f"Access label: {record.get('access_status') or 'Not supplied'}"
+        )
+
+    prompt = f"""
+Research question: {question}
+
+Write a concise literature-review outline based ONLY on the source
+information below.
+
+Rules:
+- Cite each evidence-based point using source IDs such as [S1].
+- Do not invent findings, methods, authors, dates, or citations.
+- If the supplied abstract/description does not support a conclusion,
+  say that evidence is insufficient.
+- Do not say you read a full paper when only an abstract or catalogue
+  description was supplied.
+- This is a draft for a researcher to check against original sources.
+
+Sources:
+{chr(10).join(source_blocks)}
+"""
+
+    # Use OpenAI if configured; otherwise use Gemini.
+    if openai_key:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {openai_key}"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a cautious research assistant. "
+                            "Never invent evidence or citations."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+    model = get_secret("GEMINI_MODEL") or "gemini-2.5-flash"
+    response = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{model}:generateContent",
+        params={"key": gemini_key},
+        json={
+            "systemInstruction": {
+                "parts": [{
+                    "text": (
+                        "You are a cautious research assistant. "
+                        "Never invent evidence or citations."
+                    )
+                }]
+            },
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2},
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+# ---------------------------------------------------------------------
+# Filters, screening, notes, and display
+# ---------------------------------------------------------------------
+
+def filter_records(records, key_prefix):
     sources = sorted({
         source.strip()
         for record in records
@@ -1232,11 +1297,11 @@ def filter_and_sort_records(records, key_prefix):
         if source.strip()
     })
 
-    selected_sources = st.multiselect(
+    chosen_sources = st.multiselect(
         "Filter by source",
         options=sources,
         default=sources,
-        key=f"{key_prefix}_sources",
+        key=f"{key_prefix}_filter_sources",
     )
 
     years = []
@@ -1253,17 +1318,12 @@ def filter_and_sort_records(records, key_prefix):
             min_value=min(years),
             max_value=max(years),
             value=(min(years), max(years)),
-            key=f"{key_prefix}_years",
+            key=f"{key_prefix}_filter_years",
         )
 
-    sort_order = st.selectbox(
+    sort_choice = st.selectbox(
         "Sort results",
-        [
-            "Relevance/order found",
-            "Newest first",
-            "Oldest first",
-            "Most cited",
-        ],
+        ["Relevance/order found", "Newest first", "Oldest first", "Most cited"],
         key=f"{key_prefix}_sort",
     )
 
@@ -1276,7 +1336,7 @@ def filter_and_sort_records(records, key_prefix):
             if source.strip()
         }
 
-        if selected_sources and not record_sources.intersection(selected_sources):
+        if chosen_sources and not record_sources.intersection(chosen_sources):
             continue
 
         if year_range:
@@ -1289,16 +1349,16 @@ def filter_and_sort_records(records, key_prefix):
 
         filtered.append(record)
 
-    if sort_order == "Newest first":
+    if sort_choice == "Newest first":
         filtered.sort(
             key=lambda item: int(str(item.get("year") or "0")[:4]),
             reverse=True,
         )
-    elif sort_order == "Oldest first":
+    elif sort_choice == "Oldest first":
         filtered.sort(
             key=lambda item: int(str(item.get("year") or "9999")[:4])
         )
-    elif sort_order == "Most cited":
+    elif sort_choice == "Most cited":
         filtered.sort(
             key=lambda item: int(item.get("citations") or 0),
             reverse=True,
@@ -1307,23 +1367,27 @@ def filter_and_sort_records(records, key_prefix):
     return filtered
 
 
-def display_records(records, category_key, allow_ai=False, question=""):
+def render_records(category, records, question, allow_ai=False):
     if not records:
-        st.info("No records found yet. Try a search or broaden your terms.")
+        st.info("No results yet. Run a search above.")
         return
 
-    visible_records = filter_and_sort_records(records, category_key)
-    st.write(f"Showing **{len(visible_records)}** records.")
+    visible = filter_records(records, category.replace(" ", "_"))
+    st.write(f"Showing **{len(visible)}** records.")
+
+    citation_quality_summary(visible)
 
     rows = []
-    for record in visible_records:
+    for record in visible:
+        issues = citation_issues(record)
         rows.append({
             "Title": record.get("title", ""),
             "Authors": record.get("authors", ""),
             "Date/year": record.get("year", ""),
-            "Institution/venue": record.get("venue", ""),
+            "Venue/institution": record.get("venue", ""),
             "Source": record.get("database", ""),
             "Access status": record.get("access_status", ""),
+            "Citation check": "; ".join(issues) if issues else "Basic fields present",
             "Record link": record.get("url", ""),
             "Listed document link": record.get("full_text_url", ""),
         })
@@ -1341,66 +1405,67 @@ def display_records(records, category_key, allow_ai=False, question=""):
     )
 
     st.caption(
-        "A listed document link is not verified. It may require sign-in, "
-        "payment, an archive visit, or permission from the holding institution."
+        "A listed full-text/document link has not been verified. It may "
+        "require sign-in, payment, permission, or an archive visit."
     )
 
-    st.download_button(
-        "Download CSV",
-        data=pd.DataFrame(visible_records).to_csv(index=False).encode("utf-8"),
-        file_name=f"{category_key}_records.csv",
-        mime="text/csv",
-        key=f"{category_key}_csv",
-    )
-
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         st.download_button(
-            "Download BibTeX",
-            data=make_bibtex(visible_records),
-            file_name=f"{category_key}_records.bib",
-            mime="application/x-bibtex",
-            key=f"{category_key}_bib",
+            "Download CSV",
+            data=pd.DataFrame(visible).to_csv(index=False).encode("utf-8"),
+            file_name="research_results.csv",
+            mime="text/csv",
+            key=f"{category}_csv",
         )
 
     with col2:
         st.download_button(
-            "Download RIS",
-            data=make_ris(visible_records),
-            file_name=f"{category_key}_records.ris",
-            mime="application/x-research-info-systems",
-            key=f"{category_key}_ris",
+            "Download BibTeX",
+            data=make_bibtex(visible),
+            file_name="research_results.bib",
+            mime="application/x-bibtex",
+            key=f"{category}_bib",
         )
 
     with col3:
-        outline = st.session_state.get(f"{category_key}_outline", "")
         st.download_button(
-            "Download Markdown",
-            data=make_markdown(question, visible_records, outline),
-            file_name=f"{category_key}_research.md",
-            mime="text/markdown",
-            key=f"{category_key}_md",
+            "Download RIS",
+            data=make_ris(visible),
+            file_name="research_results.ris",
+            mime="application/x-research-info-systems",
+            key=f"{category}_ris",
         )
 
-    with st.expander("View abstracts and record details"):
-        for index, record in enumerate(visible_records, start=1):
-            st.markdown(f"### {index}. {record.get('title', 'Untitled')}")
-            st.caption(
-                " · ".join(
-                    item for item in [
-                        record.get("authors") or "",
-                        str(record.get("year") or "Date not listed"),
-                        record.get("database") or "",
-                        record.get("access_status") or "",
-                    ]
-                    if item
-                )
+    outline = st.session_state.get(f"{category}_outline", "")
+
+    with col4:
+        st.download_button(
+            "Download Markdown",
+            data=make_markdown(question, visible, outline),
+            file_name="research_results.md",
+            mime="text/markdown",
+            key=f"{category}_md",
+        )
+
+    st.markdown("#### Screen records and add notes")
+    st.caption(
+        "Screening decisions and notes are saved with the project when you "
+        "click Save project."
+    )
+
+    for index, record in enumerate(visible):
+        title = record.get("title") or "Untitled"
+        with st.expander(f"{index + 1}. {title}"):
+            st.write(
+                f"**Source:** {record.get('database') or 'Not listed'}  \n"
+                f"**Date/year:** {record.get('year') or 'Not listed'}  \n"
+                f"**Access:** {record.get('access_status') or 'Not listed'}"
             )
 
             if record.get("url"):
-                st.markdown(f"[Open catalogue/record]({record['url']})")
-
+                st.markdown(f"[Open record/catalogue]({record['url']})")
             if record.get("full_text_url"):
                 st.markdown(
                     f"[Open listed document link]({record['full_text_url']})"
@@ -1413,21 +1478,62 @@ def display_records(records, category_key, allow_ai=False, question=""):
                 record.get("abstract")
                 or "No abstract or description was supplied."
             )
-            st.divider()
 
-    if allow_ai and visible_records:
+            record_id = record.get("doi") or record.get("url") or title
+            key_suffix = re.sub(r"\W+", "_", str(record_id))[:50]
+            st.selectbox(
+                "Screening decision",
+                ["Unscreened", "Include", "Exclude", "Maybe"],
+                index=(
+                    ["Unscreened", "Include", "Exclude", "Maybe"].index(
+                        record.get("screening", "Unscreened")
+                    )
+                    if record.get("screening", "Unscreened")
+                    in ["Unscreened", "Include", "Exclude", "Maybe"]
+                    else 0
+                ),
+                key=f"{category}_{key_suffix}_screening",
+                on_change=lambda r=record, k=f"{category}_{key_suffix}_screening":
+                    r.update({"screening": st.session_state[k]}),
+            )
+
+            st.text_input(
+                "Reason for decision",
+                value=record.get("screening_reason", ""),
+                key=f"{category}_{key_suffix}_reason",
+                on_change=lambda r=record, k=f"{category}_{key_suffix}_reason":
+                    r.update({"screening_reason": st.session_state[k]}),
+            )
+
+            st.text_input(
+                "Tags",
+                value=record.get("tags", ""),
+                key=f"{category}_{key_suffix}_tags",
+                on_change=lambda r=record, k=f"{category}_{key_suffix}_tags":
+                    r.update({"tags": st.session_state[k]}),
+            )
+
+            st.text_area(
+                "Researcher notes",
+                value=record.get("researcher_notes", ""),
+                key=f"{category}_{key_suffix}_notes",
+                on_change=lambda r=record, k=f"{category}_{key_suffix}_notes":
+                    r.update({"researcher_notes": st.session_state[k]}),
+            )
+
+    if allow_ai and visible:
         if st.button(
-            "Generate literature-review outline",
-            key=f"{category_key}_generate_outline",
+            "Generate evidence-linked outline",
+            key=f"{category}_generate_ai",
         ):
             try:
-                with st.spinner("Generating outline..."):
-                    outline = generate_outline(question, visible_records)
+                with st.spinner("Generating an abstract/record-based outline..."):
+                    outline = generate_outline(question, visible)
 
-                st.session_state[f"{category_key}_outline"] = outline
-                st.session_state[f"{category_key}_outline_records"] = (
-                    visible_records.copy()
-                )
+                st.session_state[f"{category}_outline"] = outline
+                st.session_state[f"{category}_outline_records"] = [
+                    record.copy() for record in visible
+                ]
                 st.rerun()
 
             except requests.RequestException as exc:
@@ -1435,179 +1541,177 @@ def display_records(records, category_key, allow_ai=False, question=""):
             except Exception as exc:
                 st.error(str(exc))
 
-        outline = st.session_state.get(f"{category_key}_outline", "")
+        outline = st.session_state.get(f"{category}_outline", "")
         outline_records = st.session_state.get(
-            f"{category_key}_outline_records", []
+            f"{category}_outline_records", []
         )
 
         if outline:
-            st.subheader("Draft literature-review outline")
+            st.subheader("AI draft outline")
             st.markdown(linkify_citations(outline, outline_records))
             st.markdown(make_reference_list(outline_records))
             st.warning(
-                "Verify every claim and citation against the original "
-                "source before using it in academic work."
+                "This outline is based on the abstracts/descriptions supplied "
+                "to the AI. Check every claim against the original sources."
             )
 
 
-def display_catalogue_links(query, category):
-    st.subheader("Official catalogue links")
-    st.write(
-        "These institutions are linked to their official sites. "
-        "The app does not scrape these catalogues unless an approved API "
-        "integration is available."
-    )
+# ---------------------------------------------------------------------
+# Search log helpers
+# ---------------------------------------------------------------------
 
-    links = catalogue_links(query, category)
+def add_search_log(category, query, sources, start_year="", end_year="",
+                   limit="", outcomes=None):
+    logs = st.session_state.setdefault("search_logs", [])
+    logs.append({
+        "searched_at": current_timestamp(),
+        "category": category,
+        "query": query,
+        "sources": sources,
+        "start_year": start_year,
+        "end_year": end_year,
+        "limit": limit,
+        "outcomes": outcomes or {},
+    })
 
-    for item in links:
-        st.markdown(
-            f"**{item['institution']}** — {item['country']}  \n"
-            f"[Open official site/catalogue]({item['url']})  \n"
-            f"{item['note']}"
-        )
+
+def show_search_logs():
+    logs = st.session_state.get("search_logs", [])
+
+    with st.expander("Reproducible search log"):
+        if not logs:
+            st.caption("No searches logged in this session/project yet.")
+        else:
+            st.dataframe(
+                pd.DataFrame(logs),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
-# ---------------------------------------------------------------------------
-# Sidebar: save and load project
-# ---------------------------------------------------------------------------
-
-init_project_db()
+# ---------------------------------------------------------------------
+# Sidebar: project loading
+# ---------------------------------------------------------------------
 
 with st.sidebar:
     st.header("Saved projects")
 
-    saved_names = list_projects()
+    try:
+        project_names = list_projects()
 
-    if saved_names:
-        selected_project = st.selectbox(
-            "Choose a saved project",
-            saved_names,
-            key="saved_project_choice",
-        )
+        if project_names:
+            chosen_project = st.selectbox(
+                "Choose a project",
+                project_names,
+                key="project_to_load",
+            )
 
-        if st.button("Load project"):
-            project = load_project(selected_project)
-            if project:
-                st.session_state["loaded_project"] = project
-                st.session_state["loaded_project_name"] = selected_project
+            if st.button("Load project"):
+                saved = load_project(chosen_project)
+                if saved:
+                    st.session_state["loaded_project_payload"] = saved
+                    st.session_state["loaded_project_name"] = chosen_project
+                    st.rerun()
+
+            if st.button("Delete project"):
+                delete_project(chosen_project)
+                st.success("Project deleted.")
                 st.rerun()
+        else:
+            st.caption("No saved projects yet.")
 
-        if st.button("Delete project"):
-            delete_project(selected_project)
-            st.success("Project deleted.")
-            st.rerun()
-    else:
-        st.caption("No saved projects yet.")
+    except Exception as exc:
+        st.error(f"Supabase connection problem: {exc}")
 
     st.divider()
-    st.caption(
-        "Projects are saved in a local SQLite file. Streamlit Community "
-        "Cloud may not preserve local files after restarts or redeployments."
-    )
+    if st.button("Log out"):
+        st.session_state["authenticated"] = False
+        st.rerun()
 
 
-# Restore a loaded project into session state.
-loaded_project = st.session_state.get("loaded_project")
-if loaded_project:
-    loaded_category = loaded_project.get("category", "Research Papers")
-    st.session_state[f"{loaded_category}_records"] = loaded_project.get(
-        "records", []
-    )
-    st.session_state[f"{loaded_category}_question"] = loaded_project.get(
-        "question", ""
-    )
-    st.session_state[f"{loaded_category}_outline"] = loaded_project.get(
-        "outline", ""
-    )
-    st.session_state[f"{loaded_category}_outline_records"] = loaded_project.get(
+# Restore project data after loading.
+loaded_payload = st.session_state.pop("loaded_project_payload", None)
+
+if loaded_payload:
+    category = loaded_payload.get("category", "Research Papers")
+    st.session_state[f"{category}_records"] = loaded_payload.get("records", [])
+    st.session_state[f"{category}_question"] = loaded_payload.get("question", "")
+    st.session_state[f"{category}_outline"] = loaded_payload.get("outline", "")
+    st.session_state[f"{category}_outline_records"] = loaded_payload.get(
         "outline_records", []
     )
-    st.session_state["loaded_project"] = None
+    st.session_state["search_logs"] = loaded_payload.get("search_logs", [])
+    st.session_state["current_save_category"] = category
 
 
-# ---------------------------------------------------------------------------
-# Main UI: separate categories
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Main interface
+# ---------------------------------------------------------------------
 
 st.title("📚 Research Assistant")
 st.write(
-    "Search research papers, historical archives, archaeological records, "
-    "and scientific research outputs."
+    "Search papers and records, screen results, keep notes, check citation "
+    "metadata, and save projects."
 )
 
 st.info(
-    "Catalogue records and listed document links are different. A catalogue "
-    "record does not mean that a document is digitized or freely accessible."
+    "Archive catalogue records, abstracts, and listed document links are "
+    "different things. The app does not promise that a listed document is "
+    "digitized, complete, or freely accessible."
 )
 
-paper_tab, corporate_tab, archaeology_tab, science_tab = st.tabs([
-    "Research Papers",
-    "Corporate & Historical Archives",
-    "Archaeological Records",
-    "Scientific Journals & Records",
-])
+papers_tab, corporate_tab, archaeology_tab, science_tab = st.tabs(CATEGORIES)
 
 
-# ---------------------------------------------------------------------------
-# Research Papers tab
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Research papers tab
+# ---------------------------------------------------------------------
 
-with paper_tab:
+with papers_tab:
     st.subheader("Research Papers")
 
-    with st.form("paper_search_form"):
-        paper_query = st.text_input(
+    with st.form("papers_search_form"):
+        query = st.text_input(
             "Research question or topic",
-            key="paper_query_input",
-            placeholder="For example: effects of urban green space on health",
+            key="Research Papers_query_input",
+            placeholder="Example: effects of urban green space on health",
         )
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            paper_start = st.number_input(
-                "From year",
-                min_value=1800,
-                max_value=2100,
-                value=2015,
-                key="paper_start",
+            start_year = st.number_input(
+                "From year", min_value=1800, max_value=2100,
+                value=2015, key="papers_start_year",
             )
         with c2:
-            paper_end = st.number_input(
-                "To year",
-                min_value=1800,
-                max_value=2100,
-                value=2025,
-                key="paper_end",
+            end_year = st.number_input(
+                "To year", min_value=1800, max_value=2100,
+                value=2025, key="papers_end_year",
             )
         with c3:
-            paper_limit = st.slider(
-                "Results per source",
-                min_value=5,
-                max_value=50,
-                value=20,
-                key="paper_limit",
+            limit = st.slider(
+                "Results per source", 5, 50, 20, key="papers_limit"
             )
 
-        paper_sources = st.multiselect(
-            "Research sources",
+        sources = st.multiselect(
+            "Sources",
             PAPER_SOURCES,
             default=PAPER_SOURCES,
-            key="paper_sources",
+            key="papers_sources",
         )
 
-        paper_submitted = st.form_submit_button(
+        submitted = st.form_submit_button(
             "Search research papers",
             type="primary",
         )
 
-    if paper_submitted:
-        if not paper_query.strip():
+    if submitted:
+        if not query.strip():
             st.error("Enter a research topic.")
-        elif paper_start > paper_end:
-            st.error("The start year must not be later than the end year.")
+        elif start_year > end_year:
+            st.error("From year must not be later than To year.")
         else:
-            searchers = {
+            search_functions = {
                 "OpenAlex": search_openalex,
                 "Crossref": search_crossref,
                 "PubMed": search_pubmed,
@@ -1618,218 +1722,224 @@ with paper_tab:
             }
 
             found = []
-            for source in paper_sources:
+            outcomes = {}
+
+            for source in sources:
                 try:
                     with st.spinner(f"Searching {source}..."):
-                        found.extend(
-                            searchers[source](
-                                paper_query,
-                                int(paper_start),
-                                int(paper_end),
-                                int(paper_limit),
-                            )
+                        results = search_functions[source](
+                            query, int(start_year), int(end_year), int(limit)
                         )
+                    found.extend(results)
+                    outcomes[source] = f"Success: {len(results)} results"
                 except Exception as exc:
+                    outcomes[source] = f"Failed: {str(exc)[:250]}"
                     st.warning(f"{source} search failed: {exc}")
 
             st.session_state["Research Papers_records"] = deduplicate(found)
-            st.session_state["Research Papers_question"] = paper_query
+            st.session_state["Research Papers_question"] = query
             st.session_state["Research Papers_outline"] = ""
             st.session_state["Research Papers_outline_records"] = []
+
+            add_search_log(
+                "Research Papers",
+                query,
+                sources,
+                int(start_year),
+                int(end_year),
+                int(limit),
+                outcomes,
+            )
 
     paper_records = st.session_state.get("Research Papers_records", [])
     paper_question = st.session_state.get(
         "Research Papers_question",
-        st.session_state.get("paper_query_input", ""),
+        st.session_state.get("Research Papers_query_input", ""),
     )
 
-    display_records(
-        paper_records,
+    render_records(
         "Research Papers",
+        paper_records,
+        paper_question,
         allow_ai=True,
-        question=paper_question,
     )
 
 
-# ---------------------------------------------------------------------------
-# Corporate & Historical Archives tab
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Corporate and historical archives tab
+# ---------------------------------------------------------------------
 
 with corporate_tab:
     st.subheader("Corporate & Historical Archives")
     st.write(
-        "Search the Library of Congress through its API, and use the official "
-        "catalogue links for other archive institutions. The app does not "
-        "scrape catalogue websites."
+        "The app directly searches the Library of Congress API. For other "
+        "institutions, it links to official catalogues rather than scraping."
     )
 
     with st.form("corporate_search_form"):
-        corporate_query = st.text_input(
+        query = st.text_input(
             "Company, organization, person, or topic",
-            key="corporate_query_input",
-            placeholder="For example: Tata Iron and Steel Company",
+            key="Corporate_query_input",
+            placeholder="Example: Tata Iron and Steel Company",
         )
-        corporate_limit = st.slider(
+        limit = st.slider(
             "Library of Congress results",
-            min_value=5,
-            max_value=50,
-            value=20,
-            key="corporate_limit",
+            5, 50, 20,
+            key="Corporate_loc_limit",
         )
-        corporate_submitted = st.form_submit_button(
+        submitted = st.form_submit_button(
             "Search archives",
             type="primary",
         )
 
-    if corporate_submitted:
-        if not corporate_query.strip():
+    if submitted:
+        if not query.strip():
             st.error("Enter a company, organization, person, or topic.")
         else:
+            outcomes = {}
             try:
                 with st.spinner("Searching Library of Congress..."):
-                    loc_records = search_library_of_congress(
-                        corporate_query,
-                        int(corporate_limit),
-                    )
-
+                    results = search_library_of_congress(query, int(limit))
                 st.session_state[
                     "Corporate & Historical Archives_records"
-                ] = loc_records
+                ] = results
                 st.session_state[
                     "Corporate & Historical Archives_question"
-                ] = corporate_query
-
+                ] = query
+                outcomes["Library of Congress"] = (
+                    f"Success: {len(results)} results"
+                )
             except Exception as exc:
+                outcomes["Library of Congress"] = f"Failed: {str(exc)[:250]}"
                 st.warning(f"Library of Congress search failed: {exc}")
 
-    corporate_records = st.session_state.get(
-        "Corporate & Historical Archives_records",
-        [],
+            add_search_log(
+                "Corporate & Historical Archives",
+                query,
+                ["Library of Congress API"],
+                outcomes=outcomes,
+            )
+
+    records = st.session_state.get(
+        "Corporate & Historical Archives_records", []
     )
-    corporate_question = st.session_state.get(
+    query = st.session_state.get(
         "Corporate & Historical Archives_question",
-        st.session_state.get("corporate_query_input", ""),
+        st.session_state.get("Corporate_query_input", ""),
     )
 
-    st.markdown("### Direct API results")
-    if corporate_records:
-        display_records(
-            corporate_records,
-            "Corporate Archives",
-            question=corporate_question,
-        )
-    else:
-        st.caption(
-            "No direct API results loaded. Use the official catalogue links "
-            "below to search archive holdings."
-        )
-
-    if corporate_question.strip():
-        display_catalogue_links(
-            corporate_question,
+    if records:
+        render_records(
             "Corporate & Historical Archives",
+            records,
+            query,
+            allow_ai=False,
         )
 
+    if query.strip():
+        show_catalogue_links(query, "Corporate & Historical Archives")
 
-# ---------------------------------------------------------------------------
-# Archaeological Records tab
-# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Archaeology tab
+# ---------------------------------------------------------------------
 
 with archaeology_tab:
     st.subheader("Archaeological Records")
     st.write(
-        "This section provides official institutional catalogue links. "
-        "The listed archaeology services are not automatically searched "
-        "unless an approved API integration is available."
+        "This section provides official catalogue links. It does not scrape "
+        "those catalogues."
     )
 
     with st.form("archaeology_search_form"):
-        archaeology_query = st.text_input(
+        query = st.text_input(
             "Site, region, period, project, or topic",
-            key="archaeology_query_input",
-            placeholder="For example: Indus Valley excavation",
+            key="Archaeology_query_input",
+            placeholder="Example: Indus Valley excavation",
         )
-        archaeology_submitted = st.form_submit_button(
+        submitted = st.form_submit_button(
             "Show archaeology catalogues",
             type="primary",
         )
 
-    if archaeology_submitted:
-        if not archaeology_query.strip():
+    if submitted:
+        if not query.strip():
             st.error("Enter a site, region, period, project, or topic.")
         else:
-            st.session_state["Archaeological Records_question"] = (
-                archaeology_query
+            st.session_state["Archaeological Records_question"] = query
+            add_search_log(
+                "Archaeological Records",
+                query,
+                ["Official catalogue links"],
+                outcomes={
+                    "Catalogue links": "Displayed; not searched by the app"
+                },
             )
 
-    archaeology_question = st.session_state.get(
+    query = st.session_state.get(
         "Archaeological Records_question",
-        st.session_state.get("archaeology_query_input", ""),
+        st.session_state.get("Archaeology_query_input", ""),
     )
 
-    if archaeology_question.strip():
-        display_catalogue_links(
-            archaeology_question,
-            "Archaeological Records",
-        )
+    if query.strip():
+        show_catalogue_links(query, "Archaeological Records")
 
 
-# ---------------------------------------------------------------------------
-# Scientific Journals & Records tab
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Scientific records tab
+# ---------------------------------------------------------------------
 
 with science_tab:
     st.subheader("Scientific Journals & Records")
-    st.write(
-        "Search scholarly articles and research outputs separately from "
-        "archive and archaeology catalogue records."
-    )
 
     with st.form("science_search_form"):
-        science_query = st.text_input(
+        query = st.text_input(
             "Scientific topic or research-output query",
-            key="science_query_input",
-            placeholder="For example: climate change crop yield dataset",
+            key="Science_query_input",
+            placeholder="Example: climate change crop yield dataset",
         )
-        science_start = st.number_input(
-            "From year",
-            min_value=1800,
-            max_value=2100,
-            value=2015,
-            key="science_start",
-        )
-        science_end = st.number_input(
-            "To year",
-            min_value=1800,
-            max_value=2100,
-            value=2025,
-            key="science_end",
-        )
-        science_limit = st.slider(
-            "Results per source",
-            min_value=5,
-            max_value=50,
-            value=20,
-            key="science_limit",
-        )
-        science_sources = st.multiselect(
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            start_year = st.number_input(
+                "From year", min_value=1800, max_value=2100,
+                value=2015, key="science_start_year",
+            )
+        with c2:
+            end_year = st.number_input(
+                "To year", min_value=1800, max_value=2100,
+                value=2025, key="science_end_year",
+            )
+        with c3:
+            limit = st.slider(
+                "Results per source", 5, 50, 20, key="science_limit"
+            )
+
+        sources = st.multiselect(
             "Scientific sources",
             PAPER_SOURCES,
-            default=["OpenAlex", "Crossref", "PubMed", "Europe PMC", "DataCite"],
+            default=[
+                "OpenAlex",
+                "Crossref",
+                "PubMed",
+                "Europe PMC",
+                "DataCite",
+            ],
             key="science_sources",
         )
-        science_submitted = st.form_submit_button(
+
+        submitted = st.form_submit_button(
             "Search scientific records",
             type="primary",
         )
 
-    if science_submitted:
-        if not science_query.strip():
-            st.error("Enter a scientific topic or query.")
-        elif science_start > science_end:
-            st.error("The start year must not be later than the end year.")
+    if submitted:
+        if not query.strip():
+            st.error("Enter a scientific topic.")
+        elif start_year > end_year:
+            st.error("From year must not be later than To year.")
         else:
-            searchers = {
+            search_functions = {
                 "OpenAlex": search_openalex,
                 "Crossref": search_crossref,
                 "PubMed": search_pubmed,
@@ -1840,18 +1950,18 @@ with science_tab:
             }
 
             found = []
-            for source in science_sources:
+            outcomes = {}
+
+            for source in sources:
                 try:
                     with st.spinner(f"Searching {source}..."):
-                        found.extend(
-                            searchers[source](
-                                science_query,
-                                int(science_start),
-                                int(science_end),
-                                int(science_limit),
-                            )
+                        results = search_functions[source](
+                            query, int(start_year), int(end_year), int(limit)
                         )
+                    found.extend(results)
+                    outcomes[source] = f"Success: {len(results)} results"
                 except Exception as exc:
+                    outcomes[source] = f"Failed: {str(exc)[:250]}"
                     st.warning(f"{source} search failed: {exc}")
 
             st.session_state[
@@ -1859,7 +1969,7 @@ with science_tab:
             ] = deduplicate(found)
             st.session_state[
                 "Scientific Journals & Records_question"
-            ] = science_query
+            ] = query
             st.session_state[
                 "Scientific Journals & Records_outline"
             ] = ""
@@ -1867,45 +1977,51 @@ with science_tab:
                 "Scientific Journals & Records_outline_records"
             ] = []
 
-    science_records = st.session_state.get(
-        "Scientific Journals & Records_records",
-        [],
+            add_search_log(
+                "Scientific Journals & Records",
+                query,
+                sources,
+                int(start_year),
+                int(end_year),
+                int(limit),
+                outcomes,
+            )
+
+    records = st.session_state.get(
+        "Scientific Journals & Records_records", []
     )
-    science_question = st.session_state.get(
+    query = st.session_state.get(
         "Scientific Journals & Records_question",
-        st.session_state.get("science_query_input", ""),
+        st.session_state.get("Science_query_input", ""),
     )
 
-    display_records(
-        science_records,
+    render_records(
         "Scientific Journals & Records",
+        records,
+        query,
         allow_ai=True,
-        question=science_question,
     )
 
-    if science_question.strip():
-        display_catalogue_links(
-            science_question,
+    if query.strip():
+        show_catalogue_links(
+            query,
             "Scientific Journals & Records",
         )
 
 
-# ---------------------------------------------------------------------------
-# Save current project
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Search log and Supabase project save/load
+# ---------------------------------------------------------------------
 
 st.divider()
-st.subheader("Save current project")
+show_search_logs()
+
+st.subheader("Save project to Supabase")
 
 category_to_save = st.selectbox(
-    "Choose which section to save",
-    [
-        "Research Papers",
-        "Corporate & Historical Archives",
-        "Archaeological Records",
-        "Scientific Journals & Records",
-    ],
-    key="save_category_choice",
+    "Section to save",
+    CATEGORIES,
+    key="category_to_save",
 )
 
 project_name = st.text_input(
@@ -1915,26 +2031,33 @@ project_name = st.text_input(
 )
 
 if st.button("Save project"):
-    records_key = f"{category_to_save}_records"
-    question_key = f"{category_to_save}_question"
-    outline_key = f"{category_to_save}_outline"
-    outline_records_key = f"{category_to_save}_outline_records"
-
-    payload = {
-        "category": category_to_save,
-        "question": st.session_state.get(question_key, ""),
-        "records": st.session_state.get(records_key, []),
-        "outline": st.session_state.get(outline_key, ""),
-        "outline_records": st.session_state.get(
-            outline_records_key, []
-        ),
-    }
+    records = st.session_state.get(f"{category_to_save}_records", [])
+    question = st.session_state.get(f"{category_to_save}_question", "")
+    outline = st.session_state.get(f"{category_to_save}_outline", "")
+    outline_records = st.session_state.get(
+        f"{category_to_save}_outline_records", []
+    )
 
     if not project_name.strip():
         st.error("Enter a project name.")
-    elif not payload["question"] and not payload["records"]:
-        st.error("Search for something before saving a project.")
+    elif not question and not records:
+        st.error("Search for something before saving.")
     else:
-        save_project(project_name.strip(), payload)
-        st.session_state["loaded_project_name"] = project_name.strip()
-        st.success(f"Saved project: {project_name.strip()}")
+        payload = {
+            "category": category_to_save,
+            "question": question,
+            "records": records,
+            "outline": outline,
+            "outline_records": outline_records,
+            "search_logs": st.session_state.get("search_logs", []),
+            "saved_at": current_timestamp(),
+        }
+
+        try:
+            save_project(project_name.strip(), payload)
+            st.session_state["loaded_project_name"] = project_name.strip()
+            st.success(
+                f"Project saved to Supabase: {project_name.strip()}"
+            )
+        except Exception as exc:
+            st.error(f"Could not save to Supabase: {exc}")
