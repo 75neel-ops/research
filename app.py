@@ -33,7 +33,7 @@ DEFAULT_SOURCES = [
     "OpenAIRE",
 ]
 
-ALL_SOURCES = DEFAULT_SOURCES + ["CORE"]
+ALL_SOURCES = DEFAULT_SOURCES
 
 
 # ---------------------------------------------------------------------------
@@ -879,12 +879,13 @@ def search_openaire(query, start_year, end_year, limit):
 # ---------------------------------------------------------------------------
 
 def generate_outline(question, records):
-    api_key = get_secret("OPENAI_API_KEY")
+    gemini_key = get_secret("GEMINI_API_KEY")
+    openai_key = get_secret("OPENAI_API_KEY")
 
-    if not api_key:
+    if not gemini_key and not openai_key:
         raise ValueError(
-            "To use AI synthesis, add OPENAI_API_KEY to "
-            ".streamlit/secrets.toml or your environment variables."
+            "Add GEMINI_API_KEY or OPENAI_API_KEY to "
+            ".streamlit/secrets.toml to use AI synthesis."
         )
 
     source_text = []
@@ -910,7 +911,7 @@ Requirements:
 - Group relevant sources into themes.
 - Cite source IDs such as [S1] next to claims.
 - Do not invent findings, methods, or citation details.
-- Clearly say when the provided abstract does not contain enough information.
+- Say when the supplied abstract does not contain enough information.
 - Treat a listed full-text link as unverified; do not claim you read the full text.
 - This is an outline for a human researcher to verify, not a finished paper.
 
@@ -918,9 +919,43 @@ Sources:
 {chr(10).join(source_text)}
 """
 
+    # Use Gemini if its key is present; otherwise use OpenAI.
+    if gemini_key:
+        response = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/"
+            "models/gemini-2.5-flash:generateContent",
+            params={"key": gemini_key},
+            json={
+                "contents": [
+                    {
+                        "parts": [{"text": prompt}]
+                    }
+                ],
+                "systemInstruction": {
+                    "parts": [
+                        {
+                            "text": (
+                                "You are a cautious research assistant. "
+                                "Use only the supplied source information. "
+                                "Never invent evidence or citations."
+                            )
+                        }
+                    ]
+                },
+                "generationConfig": {
+                    "temperature": 0.2
+                },
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
     response = requests.post(
         "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers={"Authorization": f"Bearer {openai_key}"},
         json={
             "model": "gpt-4o-mini",
             "messages": [
