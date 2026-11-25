@@ -9,6 +9,10 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 import streamlit as st
+st.set_page_config(
+    page_title="Research Assistant",
+    page_icon="research-assistant-icon.png",
+)
 
 
 # ---------------------------------------------------------------------
