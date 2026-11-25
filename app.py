@@ -1,7 +1,10 @@
 import html
+import json
 import os
 import re
+import sqlite3
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import pandas as pd
@@ -10,7 +13,7 @@ import streamlit as st
 
 
 # ---------------------------------------------------------------------------
-# App setup
+# App configuration
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
@@ -20,7 +23,7 @@ st.set_page_config(
 )
 
 HEADERS = {
-    "User-Agent": "ResearchAssistant/1.0 (scholarly search app)"
+    "User-Agent": "ResearchAssistant/1.0"
 }
 
 DEFAULT_SOURCES = [
@@ -33,15 +36,15 @@ DEFAULT_SOURCES = [
     "OpenAIRE",
 ]
 
-ALL_SOURCES = DEFAULT_SOURCES
+DB_PATH = "research_projects.db"
 
 
 # ---------------------------------------------------------------------------
-# General helpers
+# Secrets and database helpers
 # ---------------------------------------------------------------------------
 
 def get_secret(name):
-    """Read a key from Streamlit secrets, falling back to environment variables."""
+    """Read a key from Streamlit secrets or environment variables."""
     try:
         value = st.secrets.get(name, "")
     except Exception:
@@ -50,8 +53,88 @@ def get_secret(name):
     return value or os.getenv(name, "")
 
 
+def init_project_db():
+    """Create the local SQLite database and projects table if needed."""
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                name TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+
+def list_projects():
+    init_project_db()
+
+    with sqlite3.connect(DB_PATH) as connection:
+        rows = connection.execute(
+            "SELECT name FROM projects ORDER BY name"
+        ).fetchall()
+
+    return [row[0] for row in rows]
+
+
+def save_project(name, question, records, outline="", outline_records=None):
+    init_project_db()
+
+    payload = {
+        "question": question,
+        "records": records,
+        "outline": outline,
+        "outline_records": outline_records or [],
+    }
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO projects (name, updated_at, payload)
+            VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                payload = excluded.payload
+            """,
+            (name, updated_at, json.dumps(payload)),
+        )
+        connection.commit()
+
+
+def load_project(name):
+    init_project_db()
+
+    with sqlite3.connect(DB_PATH) as connection:
+        row = connection.execute(
+            "SELECT payload FROM projects WHERE name = ?",
+            (name,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return json.loads(row[0])
+
+
+def delete_project(name):
+    init_project_db()
+
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            "DELETE FROM projects WHERE name = ?",
+            (name,),
+        )
+        connection.commit()
+
+
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
+
 def clean_text(value):
-    """Remove basic HTML and normalize whitespace."""
     if not value:
         return ""
 
@@ -71,7 +154,6 @@ def make_record(
     database="",
     doi="",
 ):
-    """Create a consistent record format for all search providers."""
     abstract = clean_text(abstract)
 
     if full_text_url:
@@ -98,11 +180,12 @@ def make_record(
 
 
 def reconstruct_openalex_abstract(inverted_index):
-    """Rebuild OpenAlex's position-indexed abstract into normal text."""
+    """Convert OpenAlex's position-indexed abstract into normal text."""
     if not inverted_index:
         return ""
 
     words_by_position = {}
+
     for word, positions in inverted_index.items():
         for position in positions:
             words_by_position[position] = word
@@ -134,7 +217,7 @@ def normalize_doi(value):
 
 
 def combine_and_deduplicate(records):
-    """Deduplicate results while retaining useful data from different providers."""
+    """Combine duplicate records, retaining useful information."""
     combined = {}
 
     for record in records:
@@ -155,7 +238,6 @@ def combine_and_deduplicate(records):
 
         existing = combined[key]
 
-        # Fill missing fields from the duplicate record.
         for field in [
             "authors",
             "year",
@@ -165,22 +247,22 @@ def combine_and_deduplicate(records):
             "full_text_url",
             "venue",
             "type",
+            "citations",
         ]:
             if not existing.get(field) and record.get(field):
                 existing[field] = record[field]
 
-        # Keep the longest abstract if both providers supplied one.
         if len(record.get("abstract", "")) > len(existing.get("abstract", "")):
             existing["abstract"] = record["abstract"]
 
-        # Preserve the names of all databases where this work was found.
-        databases = set(
-            item.strip()
-            for item in (
-                (existing.get("database", "") + "," + record.get("database", ""))
-            ).split(",")
-            if item.strip()
-        )
+        databases = {
+            source.strip()
+            for source in (
+                (existing.get("database", "") + "," +
+                 record.get("database", "")).split(",")
+            )
+            if source.strip()
+        }
         existing["database"] = ", ".join(sorted(databases))
 
         if existing.get("full_text_url"):
@@ -194,7 +276,7 @@ def combine_and_deduplicate(records):
 
 
 # ---------------------------------------------------------------------------
-# OpenAlex
+# OpenAlex search
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -215,7 +297,7 @@ def search_openalex(query, start_year, end_year, limit):
             ),
         },
         headers=HEADERS,
-        timeout=30,
+        timeout=40,
     )
     response.raise_for_status()
 
@@ -224,8 +306,8 @@ def search_openalex(query, start_year, end_year, limit):
     for item in response.json().get("results", []):
         primary_location = item.get("primary_location") or {}
         source = primary_location.get("source") or {}
-
         open_access_location = item.get("best_oa_location") or {}
+
         full_text_url = (
             open_access_location.get("pdf_url")
             or open_access_location.get("landing_page_url")
@@ -233,32 +315,30 @@ def search_openalex(query, start_year, end_year, limit):
         )
 
         doi = item.get("doi") or ""
-        record_url = doi or item.get("id") or ""
 
-        records.append(
-            make_record(
-                title=item.get("title"),
-                authors=get_openalex_authors(item.get("authorships")),
-                year=item.get("publication_year"),
-                abstract=reconstruct_openalex_abstract(
-                    item.get("abstract_inverted_index")
-                ),
-                url=record_url,
-                full_text_url=full_text_url,
-                venue=source.get("display_name", ""),
-                database="OpenAlex",
-                doi=doi,
-            )
+        record = make_record(
+            title=item.get("title"),
+            authors=get_openalex_authors(item.get("authorships")),
+            year=item.get("publication_year"),
+            abstract=reconstruct_openalex_abstract(
+                item.get("abstract_inverted_index")
+            ),
+            url=doi or item.get("id") or "",
+            full_text_url=full_text_url,
+            venue=source.get("display_name", ""),
+            database="OpenAlex",
+            doi=doi,
         )
 
-        records[-1]["citations"] = item.get("cited_by_count", "")
-        records[-1]["type"] = item.get("type", "")
+        record["citations"] = item.get("cited_by_count", "")
+        record["type"] = item.get("type", "")
+        records.append(record)
 
     return records
 
 
 # ---------------------------------------------------------------------------
-# Crossref
+# Crossref search
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -278,7 +358,7 @@ def search_crossref(query, start_year, end_year, limit):
             ),
         },
         headers=HEADERS,
-        timeout=30,
+        timeout=40,
     )
     response.raise_for_status()
 
@@ -290,7 +370,8 @@ def search_crossref(query, start_year, end_year, limit):
 
         for author in item.get("author", []):
             name = " ".join(
-                part for part in [
+                part
+                for part in [
                     author.get("given", ""),
                     author.get("family", ""),
                 ]
@@ -304,7 +385,11 @@ def search_crossref(query, start_year, end_year, limit):
             or item.get("created", {}).get("date-parts")
             or [[]]
         )
-        year = date_parts[0][0] if date_parts and date_parts[0] else ""
+        year = (
+            date_parts[0][0]
+            if date_parts and date_parts[0]
+            else ""
+        )
 
         doi = item.get("DOI", "")
         doi_url = f"https://doi.org/{doi}" if doi else ""
@@ -316,27 +401,26 @@ def search_crossref(query, start_year, end_year, limit):
                 full_text_url = link["URL"]
                 break
 
-        records.append(
-            make_record(
-                title=titles[0] if titles else "Untitled",
-                authors=", ".join(authors),
-                year=year,
-                abstract=item.get("abstract", ""),
-                url=doi_url,
-                full_text_url=full_text_url,
-                venue=(item.get("container-title") or [""])[0],
-                database="Crossref",
-                doi=doi_url,
-            )
+        record = make_record(
+            title=titles[0] if titles else "Untitled",
+            authors=", ".join(authors),
+            year=year,
+            abstract=item.get("abstract", ""),
+            url=doi_url,
+            full_text_url=full_text_url,
+            venue=(item.get("container-title") or [""])[0],
+            database="Crossref",
+            doi=doi_url,
         )
 
-        records[-1]["type"] = item.get("type", "")
+        record["type"] = item.get("type", "")
+        records.append(record)
 
     return records
 
 
 # ---------------------------------------------------------------------------
-# PubMed
+# PubMed search
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -354,7 +438,7 @@ def search_pubmed(query, start_year, end_year, limit):
             "retmode": "json",
         },
         headers=HEADERS,
-        timeout=30,
+        timeout=40,
     )
     search_response.raise_for_status()
 
@@ -375,7 +459,7 @@ def search_pubmed(query, start_year, end_year, limit):
             "retmode": "xml",
         },
         headers=HEADERS,
-        timeout=30,
+        timeout=40,
     )
     fetch_response.raise_for_status()
 
@@ -391,6 +475,7 @@ def search_pubmed(query, start_year, end_year, limit):
         )
 
         abstract_parts = []
+
         for part in article.findall(".//Abstract/AbstractText"):
             text = "".join(part.itertext()).strip()
             if text:
@@ -400,6 +485,7 @@ def search_pubmed(query, start_year, end_year, limit):
                 )
 
         authors = []
+
         for author in article.findall(".//Author"):
             first = author.findtext("ForeName", "")
             last = author.findtext("LastName", "")
@@ -441,7 +527,7 @@ def search_pubmed(query, start_year, end_year, limit):
 
 
 # ---------------------------------------------------------------------------
-# Europe PMC
+# Europe PMC search
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -482,15 +568,15 @@ def search_europe_pmc(query, start_year, end_year, limit):
             )
 
         full_text_url = ""
-        link_items = (
+        links = (
             item.get("fullTextUrlList", {})
             .get("fullTextUrl", [])
         )
 
-        if isinstance(link_items, dict):
-            link_items = [link_items]
+        if isinstance(links, dict):
+            links = [links]
 
-        for link in link_items:
+        for link in links:
             if link.get("url"):
                 full_text_url = link["url"]
                 break
@@ -512,12 +598,11 @@ def search_europe_pmc(query, start_year, end_year, limit):
 
 
 # ---------------------------------------------------------------------------
-# arXiv
+# arXiv search
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_arxiv(query, start_year, end_year, limit):
-    # Request extra records because results are filtered by year afterward.
     response = requests.get(
         "https://export.arxiv.org/api/query",
         params={
@@ -527,7 +612,7 @@ def search_arxiv(query, start_year, end_year, limit):
             "sortBy": "relevance",
         },
         headers=HEADERS,
-        timeout=40,
+        timeout=50,
     )
     response.raise_for_status()
 
@@ -543,6 +628,7 @@ def search_arxiv(query, start_year, end_year, limit):
                 namespaces=namespace,
             ).split()
         )
+
         abstract = " ".join(
             entry.findtext(
                 "atom:summary",
@@ -550,6 +636,7 @@ def search_arxiv(query, start_year, end_year, limit):
                 namespaces=namespace,
             ).split()
         )
+
         record_url = entry.findtext(
             "atom:id",
             default="",
@@ -565,7 +652,7 @@ def search_arxiv(query, start_year, end_year, limit):
 
         if year:
             try:
-                if not (int(start_year) <= int(year) <= int(end_year)):
+                if not int(start_year) <= int(year) <= int(end_year):
                     continue
             except ValueError:
                 pass
@@ -604,7 +691,7 @@ def search_arxiv(query, start_year, end_year, limit):
 
 
 # ---------------------------------------------------------------------------
-# DOAJ
+# DOAJ search
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -618,7 +705,7 @@ def search_doaj(query, start_year, end_year, limit):
         endpoint,
         params={"page": 1, "pageSize": limit},
         headers=HEADERS,
-        timeout=30,
+        timeout=40,
     )
     response.raise_for_status()
 
@@ -630,7 +717,7 @@ def search_doaj(query, start_year, end_year, limit):
 
         if year:
             try:
-                if not (int(start_year) <= int(year) <= int(end_year)):
+                if not int(start_year) <= int(year) <= int(end_year):
                     continue
             except (TypeError, ValueError):
                 pass
@@ -655,10 +742,9 @@ def search_doaj(query, start_year, end_year, limit):
             record_url = links[0].get("url", "")
 
         journal = bib.get("journal", {}).get("title", "")
-        doi = bib.get("identifier", [])
-
         doi_value = ""
-        for identifier in doi:
+
+        for identifier in bib.get("identifier", []):
             if identifier.get("type", "").lower() == "doi":
                 doi_value = identifier.get("id", "")
                 break
@@ -687,87 +773,19 @@ def search_doaj(query, start_year, end_year, limit):
 
 
 # ---------------------------------------------------------------------------
-# CORE
+# OpenAIRE search
 # ---------------------------------------------------------------------------
 
-def search_core(query, start_year, end_year, limit, api_key):
-    if not api_key:
-        raise ValueError(
-            "CORE needs an API key. Add CORE_API_KEY to your secrets "
-            "or environment variables."
-        )
-
-    response = requests.post(
-        "https://api.core.ac.uk/v3/search/works",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={"q": query, "limit": limit},
-        timeout=40,
-    )
-    response.raise_for_status()
-
-    records = []
-
-    for item in response.json().get("results", []):
-        year = item.get("year")
-
-        if year:
-            try:
-                if not (int(start_year) <= int(year) <= int(end_year)):
-                    continue
-            except (TypeError, ValueError):
-                pass
-
-        authors = []
-        for author in item.get("authors", []):
-            if isinstance(author, dict):
-                authors.append(author.get("name", ""))
-            elif isinstance(author, str):
-                authors.append(author)
-
-        full_text_url = item.get("downloadUrl", "")
-        if not full_text_url:
-            urls = item.get("sourceFulltextUrls", [])
-            if urls:
-                full_text_url = urls[0]
-
-        doi = item.get("doi", "")
-        if doi and not doi.startswith("http"):
-            doi = f"https://doi.org/{doi}"
-
-        source = item.get("source") or {}
-        record_url = doi or source.get("url", "")
-
-        records.append(
-            make_record(
-                title=item.get("title"),
-                authors=", ".join(name for name in authors if name),
-                year=year,
-                abstract=item.get("abstract", ""),
-                url=record_url,
-                full_text_url=full_text_url,
-                database="CORE",
-                doi=doi,
-            )
-        )
-
-    return records
-
-
-# ---------------------------------------------------------------------------
-# OpenAIRE
-# ---------------------------------------------------------------------------
-
-def local_name(tag):
-    """Remove an XML namespace from a tag name."""
+def xml_local_name(tag):
+    """Remove XML namespace from a tag."""
     return tag.rsplit("}", 1)[-1].lower()
 
 
-def descendant_text(element, wanted_names):
-    """Find text in a descendant XML element by its local tag name."""
+def find_xml_text(element, wanted_names):
     wanted_names = {name.lower() for name in wanted_names}
 
     for child in element.iter():
-        if local_name(child.tag) in wanted_names and child.text:
+        if xml_local_name(child.tag) in wanted_names and child.text:
             text = child.text.strip()
             if text:
                 return text
@@ -787,54 +805,50 @@ def search_openaire(query, start_year, end_year, limit):
             "format": "xml",
         },
         headers=HEADERS,
-        timeout=40,
+        timeout=50,
     )
     response.raise_for_status()
 
     root = ET.fromstring(response.text)
     records = []
 
-    # OpenAIRE's XML structure may include nested result elements.
     for element in root.iter():
-        if local_name(element.tag) != "result":
+        if xml_local_name(element.tag) != "result":
             continue
 
-        title = descendant_text(element, {"title"})
+        title = find_xml_text(element, {"title"})
         if not title:
             continue
 
         authors = []
         for child in element.iter():
-            if local_name(child.tag) in {"creator", "author"} and child.text:
+            if xml_local_name(child.tag) in {"creator", "author"} and child.text:
                 name = child.text.strip()
                 if name and name not in authors:
                     authors.append(name)
 
-        year = descendant_text(
+        date_text = find_xml_text(
             element,
             {"dateofacceptance", "publicationdate", "date"},
         )
-        year_match = re.search(r"\b(19|20)\d{2}\b", year or "")
+        year_match = re.search(r"\b(?:19|20)\d{2}\b", date_text or "")
         year = year_match.group(0) if year_match else ""
 
-        # OpenAIRE may list repository or full-text-related URLs.
-        # We label these as listed links, not as verified downloadable files.
         listed_url = ""
         full_text_url = ""
 
         for child in element.iter():
-            tag = local_name(child.tag)
+            tag = xml_local_name(child.tag)
             if tag in {"webresource", "url"} and child.text:
                 candidate = child.text.strip()
                 if candidate.startswith("http"):
                     listed_url = listed_url or candidate
-
                     if tag == "webresource":
                         full_text_url = candidate
 
         doi = ""
         for child in element.iter():
-            if local_name(child.tag) == "pid" and child.text:
+            if xml_local_name(child.tag) == "pid" and child.text:
                 pid_type = (child.attrib.get("class") or "").lower()
                 pid_value = child.text.strip()
 
@@ -860,7 +874,7 @@ def search_openaire(query, start_year, end_year, limit):
                 title=title,
                 authors=", ".join(authors),
                 year=year,
-                abstract=descendant_text(element, {"description"}),
+                abstract=find_xml_text(element, {"description"}),
                 url=record_url,
                 full_text_url=full_text_url,
                 database="OpenAIRE",
@@ -875,7 +889,7 @@ def search_openaire(query, start_year, end_year, limit):
 
 
 # ---------------------------------------------------------------------------
-# AI literature-review outline
+# AI outline generation: Gemini preferred, OpenAI as fallback
 # ---------------------------------------------------------------------------
 
 def generate_outline(question, records):
@@ -884,13 +898,13 @@ def generate_outline(question, records):
 
     if not gemini_key and not openai_key:
         raise ValueError(
-            "Add GEMINI_API_KEY or OPENAI_API_KEY to "
-            ".streamlit/secrets.toml to use AI synthesis."
+            "Add GEMINI_API_KEY or OPENAI_API_KEY to Streamlit secrets "
+            "to generate an AI outline."
         )
 
     source_text = []
 
-    for index, record in enumerate(records[:30], start=1):
+    for index, record in enumerate(records, start=1):
         source_text.append(
             f"[S{index}] {record.get('title', 'Untitled')}\n"
             f"Authors: {record.get('authors') or 'Not listed'}\n"
@@ -905,32 +919,27 @@ def generate_outline(question, records):
 Research question:
 {question}
 
-Create a literature-review outline using only the source details below.
+Create a literature-review outline using only the source information below.
 
 Requirements:
 - Group relevant sources into themes.
-- Cite source IDs such as [S1] next to claims.
-- Do not invent findings, methods, or citation details.
-- Say when the supplied abstract does not contain enough information.
-- Treat a listed full-text link as unverified; do not claim you read the full text.
+- Cite sources using IDs such as [S1] and [S2].
+- Do not invent findings, methods, authors, or citations.
+- Say when an abstract does not provide enough information.
+- A listed full-text link is unverified. Do not claim you read the full text.
 - This is an outline for a human researcher to verify, not a finished paper.
 
 Sources:
 {chr(10).join(source_text)}
 """
 
-    # Use Gemini if its key is present; otherwise use OpenAI.
+    # Prefer Gemini when its key is available.
     if gemini_key:
         response = requests.post(
             "https://generativelanguage.googleapis.com/v1beta/"
             "models/gemini-2.5-flash:generateContent",
             params={"key": gemini_key},
             json={
-                "contents": [
-                    {
-                        "parts": [{"text": prompt}]
-                    }
-                ],
                 "systemInstruction": {
                     "parts": [
                         {
@@ -942,6 +951,11 @@ Sources:
                         }
                     ]
                 },
+                "contents": [
+                    {
+                        "parts": [{"text": prompt}]
+                    }
+                ],
                 "generationConfig": {
                     "temperature": 0.2
                 },
@@ -949,10 +963,11 @@ Sources:
             timeout=90,
         )
         response.raise_for_status()
-        data = response.json()
 
+        data = response.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
+    # If there is no Gemini key, use OpenAI.
     response = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {openai_key}"},
@@ -963,8 +978,8 @@ Sources:
                     "role": "system",
                     "content": (
                         "You are a cautious research assistant. "
-                        "Use only the supplied source information and "
-                        "never invent evidence or citations."
+                        "Use only supplied source information and never "
+                        "invent evidence or citations."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -979,25 +994,250 @@ Sources:
 
 
 # ---------------------------------------------------------------------------
-# User interface
+# Citation and export helpers
+# ---------------------------------------------------------------------------
+
+def linkify_source_citations(text, records):
+    """Turn [S1] citations into clickable links to their records."""
+    def replace(match):
+        source_number = int(match.group(1))
+        index = source_number - 1
+
+        if index < 0 or index >= len(records):
+            return match.group(0)
+
+        url = records[index].get("url")
+        if not url:
+            return match.group(0)
+
+        return f"[S{source_number}]({url})"
+
+    return re.sub(r"\[S(\d+)\]", replace, text)
+
+
+def make_reference_list(records):
+    lines = ["## References"]
+
+    for index, record in enumerate(records, start=1):
+        authors = record.get("authors") or "Authors not listed"
+        year = record.get("year") or "Year not listed"
+        title = record.get("title") or "Untitled"
+        venue = record.get("venue") or ""
+        url = record.get("url") or ""
+
+        reference = f"[S{index}] {authors} ({year}). *{title}*."
+        if venue:
+            reference += f" {venue}."
+        if url:
+            reference += f" [Open source]({url})"
+
+        lines.append(reference)
+
+    return "\n".join(lines)
+
+
+def bibtex_escape(value):
+    value = str(value or "")
+    return (
+        value.replace("\\", r"\textbackslash{}")
+        .replace("&", r"\&")
+        .replace("%", r"\%")
+        .replace("$", r"\$")
+        .replace("#", r"\#")
+        .replace("_", r"\_")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+    )
+
+
+def make_bibtex(records):
+    entries = []
+
+    for index, record in enumerate(records, start=1):
+        title = record.get("title") or "Untitled"
+        authors = record.get("authors") or ""
+        year = str(record.get("year") or "")
+
+        first_author = authors.split(",")[0] if authors else "source"
+        key_author = re.sub(
+            r"[^A-Za-z0-9]",
+            "",
+            first_author.split()[-1],
+        )
+        citation_key = f"{key_author or 'source'}{year or 'nd'}{index}"
+
+        fields = {
+            "title": title,
+            "author": authors,
+            "year": year,
+            "journal": record.get("venue", ""),
+            "doi": normalize_doi(record.get("doi", "")),
+            "url": record.get("url", ""),
+        }
+
+        lines = [f"@misc{{{citation_key},"]
+        for field, value in fields.items():
+            if value:
+                lines.append(
+                    f"  {field} = {{{bibtex_escape(value)}}},"
+                )
+        lines.append("}")
+        entries.append("\n".join(lines))
+
+    return "\n\n".join(entries)
+
+
+def make_ris(records):
+    entries = []
+
+    for record in records:
+        lines = ["TY  - JOUR"]
+
+        if record.get("title"):
+            lines.append(f"TI  - {record['title']}")
+
+        for author in (record.get("authors") or "").split(","):
+            author = author.strip()
+            if author:
+                lines.append(f"AU  - {author}")
+
+        if record.get("year"):
+            lines.append(f"PY  - {record['year']}")
+
+        if record.get("venue"):
+            lines.append(f"JO  - {record['venue']}")
+
+        doi = normalize_doi(record.get("doi", ""))
+        if doi:
+            lines.append(f"DO  - {doi}")
+
+        if record.get("url"):
+            lines.append(f"UR  - {record['url']}")
+
+        if record.get("abstract"):
+            lines.append(f"AB  - {record['abstract']}")
+
+        lines.extend(["ER  - ", ""])
+        entries.append("\n".join(lines))
+
+    return "\n".join(entries)
+
+
+def make_markdown_export(question, records, outline=""):
+    lines = [
+        f"# Research project: {question}",
+        "",
+    ]
+
+    if outline:
+        lines.extend([outline, ""])
+
+    lines.append("## Sources")
+
+    for index, record in enumerate(records, start=1):
+        title = record.get("title") or "Untitled"
+        url = record.get("url") or ""
+        authors = record.get("authors") or "Authors not listed"
+        year = record.get("year") or "Year not listed"
+        access = record.get("access_status") or "Record only"
+
+        if url:
+            lines.append(f"{index}. [{title}]({url})")
+        else:
+            lines.append(f"{index}. {title}")
+
+        lines.append(f"   - Authors: {authors}")
+        lines.append(f"   - Year: {year}")
+        lines.append(f"   - Found in: {record.get('database', '')}")
+        lines.append(f"   - Access: {access}")
+
+        if record.get("full_text_url"):
+            lines.append(
+                f"   - Listed full-text link: {record['full_text_url']}"
+            )
+
+        if record.get("abstract"):
+            lines.append(f"   - Abstract: {record['abstract']}")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Load saved-project controls before creating the search form
+# ---------------------------------------------------------------------------
+
+init_project_db()
+
+with st.sidebar:
+    st.header("Saved projects")
+
+    project_names = list_projects()
+
+    if project_names:
+        chosen_project = st.selectbox(
+            "Choose a project",
+            options=project_names,
+            key="load_project_selection",
+        )
+
+        if st.button("Load project"):
+            project = load_project(chosen_project)
+
+            if project:
+                st.session_state["question_input"] = project.get(
+                    "question", ""
+                )
+                st.session_state["records"] = project.get("records", [])
+                st.session_state["question"] = project.get("question", "")
+                st.session_state["outline"] = project.get("outline", "")
+                st.session_state["outline_records"] = project.get(
+                    "outline_records", []
+                )
+                st.session_state["active_project"] = chosen_project
+                st.rerun()
+
+        if st.button("Delete project"):
+            delete_project(chosen_project)
+            st.success("Project deleted.")
+            st.rerun()
+    else:
+        st.caption("No saved projects yet.")
+
+    st.divider()
+    st.caption(
+        "Saved projects use a local SQLite file. For dependable cloud "
+        "storage, connect a hosted database."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main interface and search
 # ---------------------------------------------------------------------------
 
 st.title("📚 Research Assistant")
 st.write(
-    "Search scholarly sources, review paper records and links, "
+    "Search scholarly sources, review records and links, organize papers, "
     "and create a source-linked literature-review outline."
 )
 
 st.info(
-    "A 'Full-text link listed' label means a provider listed a possible "
-    "full-text link. The app does not verify that the file opens or that "
-    "you have permission to access it."
+    "A 'Full-text link listed' label means a provider supplied a possible "
+    "full-text link. The app does not verify that the link works or that "
+    "you have access."
 )
+
+if "question_input" not in st.session_state:
+    st.session_state["question_input"] = ""
 
 with st.form("research_search"):
     question = st.text_input(
         "Research topic or question",
-        placeholder="For example: How does urban green space affect mental health?",
+        key="question_input",
+        placeholder=(
+            "For example: How does urban green space affect mental health?"
+        ),
     )
 
     col1, col2, col3 = st.columns(3)
@@ -1028,9 +1268,8 @@ with st.form("research_search"):
 
     selected_sources = st.multiselect(
         "Sources to search",
-        options=ALL_SOURCES,
+        options=DEFAULT_SOURCES,
         default=DEFAULT_SOURCES,
-        help="CORE requires a CORE API key. Add it to Streamlit secrets.",
     )
 
     submitted = st.form_submit_button(
@@ -1066,51 +1305,140 @@ if submitted:
             "DOAJ": lambda: search_doaj(
                 question, int(start_year), int(end_year), int(limit)
             ),
-            "CORE": lambda: search_core(
-                question,
-                int(start_year),
-                int(end_year),
-                int(limit),
-                get_secret("CORE_API_KEY"),
-            ),
             "OpenAIRE": lambda: search_openaire(
                 question, int(start_year), int(end_year), int(limit)
             ),
         }
 
-        all_records = []
+        found_records = []
 
         for source in selected_sources:
             try:
                 with st.spinner(f"Searching {source}..."):
-                    all_records.extend(search_functions[source]())
+                    found_records.extend(search_functions[source]())
             except requests.RequestException as exc:
                 st.warning(f"{source} search failed: {exc}")
             except Exception as exc:
                 st.warning(f"{source} could not be searched: {exc}")
 
-        records = combine_and_deduplicate(all_records)
-
-        st.session_state["records"] = records
+        st.session_state["records"] = combine_and_deduplicate(found_records)
         st.session_state["question"] = question
+        st.session_state["outline"] = ""
+        st.session_state["outline_records"] = []
 
 
-# Display search results saved in this session.
+# ---------------------------------------------------------------------------
+# Results, filters, sorting, downloads, and saved-project tools
+# ---------------------------------------------------------------------------
+
 if "records" in st.session_state:
-    records = st.session_state["records"]
+    all_records = st.session_state["records"]
 
-    st.subheader(f"Results: {len(records)} unique records")
+    st.subheader(f"Search results: {len(all_records)} unique records")
 
-    if not records:
+    if not all_records:
         st.info(
             "No results were returned. Try different wording, a wider date "
             "range, or different sources."
         )
     else:
-        table_rows = []
+        st.subheader("Filter and sort results")
+
+        available_sources = sorted({
+            source.strip()
+            for record in all_records
+            for source in (record.get("database") or "").split(",")
+            if source.strip()
+        })
+
+        selected_filter_sources = st.multiselect(
+            "Filter by source",
+            options=available_sources,
+            default=available_sources,
+        )
+
+        available_years = []
+        for record in all_records:
+            try:
+                available_years.append(int(record.get("year")))
+            except (TypeError, ValueError):
+                pass
+
+        year_range = None
+        if available_years:
+            minimum_year = min(available_years)
+            maximum_year = max(available_years)
+
+            if minimum_year == maximum_year:
+                st.caption(f"Publication year: {minimum_year}")
+                year_range = (minimum_year, maximum_year)
+            else:
+                year_range = st.slider(
+                    "Filter by publication year",
+                    min_value=minimum_year,
+                    max_value=maximum_year,
+                    value=(minimum_year, maximum_year),
+                )
+
+        sort_by = st.selectbox(
+            "Sort results by",
+            [
+                "Relevance/order found",
+                "Newest first",
+                "Oldest first",
+                "Most cited",
+            ],
+        )
+
+        filtered_records = []
+
+        for record in all_records:
+            record_sources = {
+                source.strip()
+                for source in (record.get("database") or "").split(",")
+                if source.strip()
+            }
+
+            if (
+                selected_filter_sources
+                and not record_sources.intersection(selected_filter_sources)
+            ):
+                continue
+
+            if year_range:
+                try:
+                    record_year = int(record.get("year"))
+                    if not year_range[0] <= record_year <= year_range[1]:
+                        continue
+                except (TypeError, ValueError):
+                    # Keep records with missing/unclear years.
+                    pass
+
+            filtered_records.append(record)
+
+        if sort_by == "Newest first":
+            filtered_records.sort(
+                key=lambda item: int(item.get("year") or 0),
+                reverse=True,
+            )
+        elif sort_by == "Oldest first":
+            filtered_records.sort(
+                key=lambda item: int(item.get("year") or 9999),
+            )
+        elif sort_by == "Most cited":
+            filtered_records.sort(
+                key=lambda item: int(item.get("citations") or 0),
+                reverse=True,
+            )
+
+        records = filtered_records
+
+        st.write(f"Showing **{len(records)}** records after filtering.")
+
+        display_rows = []
 
         for record in records:
-            table_rows.append(
+            display_rows.append(
                 {
                     "Title": record.get("title", ""),
                     "Authors": record.get("authors", ""),
@@ -1124,27 +1452,74 @@ if "records" in st.session_state:
             )
 
         st.dataframe(
-            pd.DataFrame(table_rows),
+            pd.DataFrame(display_rows),
             use_container_width=True,
             hide_index=True,
             column_config={
                 "Record link": st.column_config.LinkColumn("Record link"),
-                "Full-text link": st.column_config.LinkColumn("Full-text link"),
+                "Full-text link": st.column_config.LinkColumn(
+                    "Full-text link"
+                ),
             },
         )
 
-        csv_data = pd.DataFrame(records).to_csv(index=False).encode("utf-8")
-
-        st.download_button(
-            label="Download results as CSV",
-            data=csv_data,
-            file_name="research_sources.csv",
-            mime="text/csv",
+        st.caption(
+            "Search results and abstracts are supplied by the listed "
+            "research services. Check original sources before citing."
         )
 
+        # CSV, BibTeX, RIS, and Markdown downloads.
+        csv_data = pd.DataFrame(records).to_csv(index=False).encode("utf-8")
+
+        download_col1, download_col2, download_col3, download_col4 = (
+            st.columns(4)
+        )
+
+        with download_col1:
+            st.download_button(
+                "Download CSV",
+                data=csv_data,
+                file_name="research_sources.csv",
+                mime="text/csv",
+            )
+
+        with download_col2:
+            st.download_button(
+                "Download BibTeX",
+                data=make_bibtex(records),
+                file_name="research_sources.bib",
+                mime="application/x-bibtex",
+            )
+
+        with download_col3:
+            st.download_button(
+                "Download RIS",
+                data=make_ris(records),
+                file_name="research_sources.ris",
+                mime="application/x-research-info-systems",
+            )
+
+        outline = st.session_state.get("outline", "")
+        markdown_data = make_markdown_export(
+            st.session_state.get("question", "Research project"),
+            records,
+            outline,
+        )
+
+        with download_col4:
+            st.download_button(
+                "Download Markdown",
+                data=markdown_data,
+                file_name="research_project.md",
+                mime="text/markdown",
+            )
+
+        # Review abstracts and links.
         with st.expander("Review abstracts and source details"):
             for index, record in enumerate(records, start=1):
-                st.markdown(f"### [{index}] {record.get('title', 'Untitled')}")
+                st.markdown(
+                    f"### [{index}] {record.get('title', 'Untitled')}"
+                )
 
                 details = [
                     record.get("authors") or "Authors not listed",
@@ -1159,7 +1534,7 @@ if "records" in st.session_state:
 
                 if record.get("full_text_url"):
                     st.markdown(
-                        f"[Open listed full-text link]"
+                        "[Open listed full-text link]"
                         f"({record['full_text_url']})"
                     )
 
@@ -1169,22 +1544,64 @@ if "records" in st.session_state:
                 )
                 st.divider()
 
+        # AI outline generation uses the currently filtered/sorted records.
         if st.button("Generate literature-review outline"):
-            try:
-                with st.spinner("Creating a draft outline..."):
-                    outline = generate_outline(
-                        st.session_state["question"],
-                        records,
-                    )
+            if not records:
+                st.warning("There are no visible records to use.")
+            else:
+                try:
+                    with st.spinner("Creating a draft outline..."):
+                        generated_outline = generate_outline(
+                            st.session_state.get("question", ""),
+                            records,
+                        )
 
-                st.subheader("Draft literature-review outline")
-                st.markdown(outline)
-                st.warning(
-                    "Verify every claim and citation against the original "
-                    "paper before using it in academic work."
+                    st.session_state["outline"] = generated_outline
+                    st.session_state["outline_records"] = records.copy()
+                    st.rerun()
+
+                except requests.RequestException as exc:
+                    st.error(f"The AI service request failed: {exc}")
+                except Exception as exc:
+                    st.error(str(exc))
+
+        # Show the outline and references, using the exact source order
+        # that was sent to the AI.
+        saved_outline = st.session_state.get("outline", "")
+        outline_records = st.session_state.get("outline_records", [])
+
+        if saved_outline:
+            st.subheader("Draft literature-review outline")
+            st.markdown(
+                linkify_source_citations(saved_outline, outline_records)
+            )
+            st.markdown(make_reference_list(outline_records))
+            st.warning(
+                "Verify every claim and citation against the original "
+                "source before using it in academic work."
+            )
+
+        # Save the project.
+        st.subheader("Save this project")
+
+        project_name = st.text_input(
+            "Project name",
+            value=st.session_state.get("active_project", ""),
+            key="project_name_input",
+        )
+
+        if st.button("Save project"):
+            if not project_name.strip():
+                st.error("Enter a project name first.")
+            else:
+                save_project(
+                    name=project_name.strip(),
+                    question=st.session_state.get("question", ""),
+                    records=all_records,
+                    outline=st.session_state.get("outline", ""),
+                    outline_records=st.session_state.get(
+                        "outline_records", []
+                    ),
                 )
-
-            except requests.RequestException as exc:
-                st.error(f"The AI service request failed: {exc}")
-            except Exception as exc:
-                st.error(str(exc))
+                st.session_state["active_project"] = project_name.strip()
+                st.success(f"Saved project: {project_name.strip()}")
