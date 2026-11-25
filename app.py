@@ -458,7 +458,7 @@ def search_europe_pmc(query, start_year, end_year, limit):
             "pageSize": limit,
         },
         headers=HEADERS,
-        timeout=30,
+        timeout=60,
     )
     response.raise_for_status()
 
