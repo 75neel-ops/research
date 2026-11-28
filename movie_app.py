@@ -304,6 +304,8 @@ def search_europeana_films(query, limit, api_key):
             params={
                 "wskey": api_key,
                 "query": query,
+                "qf": "TYPE:VIDEO",
+                "media": "true",
                 "rows": limit,
                 "profile": "rich",
             },
@@ -333,6 +335,11 @@ def search_europeana_films(query, limit, api_key):
     results = []
 
     for item in items:
+        # Keep video records only when the API supplies a media type.
+        media_type = str(item.get("type", "")).strip().upper()
+        if media_type and media_type != "VIDEO":
+            continue
+
         record_url = (
             value_as_text(item.get("edmIsShownAt"))
             or item.get("guid", "")
@@ -341,7 +348,7 @@ def search_europeana_films(query, limit, api_key):
         provider = value_as_text(item.get("dataProvider"))
 
         results.append({
-            "title": value_as_text(item.get("title")) or "Untitled record",
+            "title": value_as_text(item.get("title")) or "Untitled video record",
             "date": value_as_text(item.get("year")),
             "creator": value_as_text(item.get("dcCreator")),
             "description": value_as_text(item.get("dcDescription")),
@@ -349,8 +356,8 @@ def search_europeana_films(query, limit, api_key):
             "digital_url": digital_url,
             "source": f"Europeana — {provider}" if provider else "Europeana",
             "access_note": (
-                "Europeana lists a digital item link; it has not been "
-                "verified and may have access restrictions."
+                "Europeana video record. The listed media link, if any, "
+                "has not been verified and may have access restrictions."
             ),
         })
 
